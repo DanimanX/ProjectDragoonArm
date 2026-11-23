@@ -1,0 +1,31 @@
+# build output
+build*/
+dist/
+deps/
+extern/
+
+# upstream checkouts kept for reference, not part of this repository
+/Azel/
+/Lagi/
+/atolm/
+/pds-tools/
+
+# game data: never committed (own disc only)
+work/
+engine-data/
+Azel/data/
+*.7z
+*.bin
+*.cue
+*.iso
+*.chd
+data/disc*/
+
+# local artifacts
+*.o
+*.a
+*.so
+*.ppm
+*.xwd
+core
+log.txt

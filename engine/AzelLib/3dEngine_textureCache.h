@@ -1,0 +1,30 @@
+struct s_vertice
+{
+    float m_coordianges[3];
+    float m_originalVertices[4];
+    float m_color[4];
+}; 
+
+struct s_quad
+{
+    u8* model;
+    char isInitialized;
+    s_vertice m_vertices[4];
+    u16 CMDCTRL;
+    u16 CMDPMOD;
+    u16 CMDCOLR;
+    u16 CMDSRCA;
+    u16 CMDSIZE;
+
+    u32 gouraudPointer;
+
+    // world space
+    float m_modelMatrix[4 * 4];
+};
+
+void clearVdp1TextureCache();
+void invalidateVdp1TextureRange(u32 vdp1Offset, u32 size);
+void invalidateCramRange(u32 cramOffset, u32 size);
+u32* decodeVdp1Quad(s_quad quad, u16& textureWidth, u16& textureHeight);
+unsigned int getTextureForQuad(s_quad& quad);
+bgfx::TextureHandle getTextureForQuadBGFX(s_quad& quad);

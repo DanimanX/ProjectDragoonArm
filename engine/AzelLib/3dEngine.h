@@ -1,0 +1,110 @@
+#pragma once
+
+void resetCamera(u32 x0, u32 y0, u32 x1, u32 y1, u32 centerX, u32 centerY);
+
+void reset3dEngine();
+void resetProjectVector();
+void pushProjectionStack();
+void dragonFieldTaskDrawSub3Sub1(); // 0601e1c8 - popProjectionStack + Saturn VDP sync
+
+void setupLight(fixedPoint r4, fixedPoint r5, fixedPoint r6, u32 r7);
+void setupLightColor(u32 r4);
+void generateLightFalloffMap(u32 r4, u32 r5, u32 r6);
+void generateMasterLightFalloffMapInterpolated(const fixedPoint* pData);
+
+void dragonFieldTaskDrawSub1Sub0();
+void dragonFieldTaskDrawSub1Sub1(fixedPoint r4, fixedPoint r5, fixedPoint r6, u32 r7 = 0);
+
+struct s_cameraProperties2
+{
+    sVec3_FP m0_position; //0
+    sVec3_S16 mC_rotation;
+    sVec3_FP m14_previousPosition; //14
+    s16 m20_previousRotation[3]; // 20
+    sMatrix4x3 m28[2]; // 28
+
+    sMatrix4x3 m88_billboardViewMatrix; // 88
+};
+extern s_cameraProperties2 cameraProperties2;
+
+struct sCameraProperties
+{
+    s16 m8; //8
+    s16 mA; //A
+    s16 mC; //C
+    s16 mE; //E
+
+    s16 x0; // 3C
+    s16 y0; // 3E
+    s16 x1; // 40
+    s16 y1; // 42
+    s16 centerX; // 44
+    s16 centerY; // 465
+};
+extern sCameraProperties cameraProperties;
+
+extern sMatrix4x3* pCurrentMatrix;
+
+void addObjectToDrawList(struct sProcessed3dModel* pObjectData);
+void addBillBoardToDrawList(struct sProcessed3dModel* pObjectData);
+struct sProcessed3dModel* drawCurrentObjectInstanced(struct sProcessed3dModel* pModel, struct sProcessed3dModel* pInstanceData);
+
+void updateEngineCamera(s_cameraProperties2* r4, const sVec3_FP& r5_position, const sVec3_S16& r6_rotation);
+
+void multiplyMatrix(sMatrix4x3* matrixA, sMatrix4x3* matrixB);
+
+void copyMatrix(sMatrix4x3* pSrc, sMatrix4x3* pDst);
+void copyToCurrentMatrix(sMatrix4x3* pSrc);
+void initMatrixToIdentity(sMatrix4x3* matrix);
+void resetMatrixStack();
+void pushCurrentMatrix();
+void popMatrix();
+
+void rotateMatrixX(s32 rotX, sMatrix4x3* pMatrix);
+void rotateMatrixShiftedX(fixedPoint rotX, sMatrix4x3* pMatrix);
+void rotateCurrentMatrixShiftedX(fixedPoint rotX);
+void rotateCurrentMatrixX(s32 rotX);
+void rotateMatrixY(s32 rotY, sMatrix4x3* pMatrix);
+void rotateMatrixShiftedY(fixedPoint rotY, sMatrix4x3* pMatrix);
+void rotateCurrentMatrixY(s32 rotY);
+void rotateCurrentMatrixShiftedY(fixedPoint rotY);
+void rotateMatrixZ(s32 rotZ, sMatrix4x3* pMatrix);
+void rotateMatrixShiftedZ(fixedPoint rotZ, sMatrix4x3* pMatrix);
+void rotateCurrentMatrixZ(s32 rotZ);
+void rotateCurrentMatrixShiftedZ(fixedPoint rotZ);
+void translateMatrix(const sVec3_FP& translation, sMatrix4x3* pMatrix);
+void translateMatrix(const sVec3_FP* translation, sMatrix4x3* pMatrix);
+void translateCurrentMatrix(const sVec3_FP* translation);
+void translateCurrentMatrix(const sVec3_FP& translation);
+void rotateMatrixYXZ(sVec3_FP* rotationVec, sMatrix4x3* pMatrix);
+void rotateMatrixYXZ(const sVec3_FP* rotationVec, sMatrix4x3* pMatrix);
+void rotateMatrixZYX(const sVec3_FP* rotationVec, sMatrix4x3* pMatrix);
+void rotateCurrentMatrixZYX(const sVec3_FP* rotationVec);
+void rotateCurrentMatrixZYX(const sVec3_FP& rotationVec);
+void rotateCurrentMatrixYXZ(const sVec3_FP* rotationVec);
+void rotateCurrentMatrixYXZ(const sVec3_FP& rotationVec);
+void rotateMatrixZYX_s16(const sVec3_S16_12_4& rotationVec, sMatrix4x3* pMatrix);
+void rotateCurrentMatrixZYX_s16(const sVec3_S16_12_4& rotationVec);
+void multiplyCurrentMatrix(sMatrix4x3* arg4);
+void multiplyCurrentMatrixSaveStack(sMatrix4x3* arg4);
+
+void scaleMatrixRow0(fixedPoint r4, sMatrix4x3* pMatrix);
+void scaleMatrixRow1(fixedPoint r4, sMatrix4x3* pMatrix);
+void scaleMatrixRow2(fixedPoint r4, sMatrix4x3* pMatrix);
+
+void scaleCurrentMatrixRow0(s32 r4);
+void scaleCurrentMatrixRow1(s32 r4);
+void scaleCurrentMatrixRow2(s32 r4);
+
+fixedPoint vecDistance(const sVec3_FP& r4, const sVec3_FP& r5);
+
+void transformAndAddVec(const sVec3_FP& r4, sVec3_FP& r5, const sMatrix4x3& r6);
+void transformAndAddVecByCurrentMatrix(const sVec3_FP* r4, sVec3_FP* r5);
+void transformVecByCurrentMatrix(const sVec3_FP& r4, sVec3_FP& r5);
+
+fixedPoint transformByMatrixRow0(const sVec3_FP& r4);
+fixedPoint transformByMatrixRow1(const sVec3_FP& r4);
+s32 transformVecGetY(const sVec3_FP& vec, const sMatrix4x3& mat);
+fixedPoint transformByMatrixRow2(const sVec3_FP& r4);
+
+fixedPoint MulVec2(const sVec2_FP& r4, const sVec2_FP& r5);

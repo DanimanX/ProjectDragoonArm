@@ -1,0 +1,4 @@
+#ifndef PROJECTDRAGOON_BX_ALLOCATOR_H
+#define PROJECTDRAGOON_BX_ALLOCATOR_H
+#include "bx.h"
+#endif

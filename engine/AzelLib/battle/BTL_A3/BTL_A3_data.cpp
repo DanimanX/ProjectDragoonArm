@@ -1,0 +1,300 @@
+#include "PDS.h"
+#include "BTL_A3_data.h"
+p_workArea createPattergoHealerParticleEffect(s_workAreaCopy* pParent);
+p_workArea createPattergoMultiParticleEffect(s_workAreaCopy* pParent);
+p_workArea urchinAttack_spawnProjectile(s_workAreaCopy* pParent);
+#include "BTL_A3_map3.h"
+#include "BTL_A3_map4.h"
+#include "BTL_A3_map6.h"
+#include "BTL_A3_gnd.h"
+#include "BTL_A3_wtr.h"
+#include "BTL_A3_BaldorFormation.h"
+#include "BTL_A3_UrchinFormation.h"
+#include "BTL_A3_BaldorQueenFormation.h"
+#include "kernel/grid.h"
+
+struct BTL_A3_data* g_BTL_A3 = nullptr;
+
+sSaturnPtr BTL_A3_data::getEncounterDataTable()
+{
+    return getSaturnPtr(0x60AAFA0);
+}
+
+sSaturnPtr BTL_A3_data::getBerserkScrollConfigTable()
+{
+    return getSaturnPtr(0x060b15d0);
+}
+
+void BTL_A3_data::invoke(sSaturnPtr Func, s_workAreaCopy* pParent, u32 arg0, u32 arg1)
+{
+    switch (Func.m_offset)
+    {
+    case 0x060565da:
+        Create_BTL_A3_BaldorFormation(pParent, arg0);
+        break;
+    case 0x6054DF4:
+        Create_BTL_A3_UrchinFormationConfig(pParent, arg0);
+        break;
+    case 0x06058da4:
+        Create_BTL_A3_BaldorQueenFormation(pParent, arg0);
+        break;
+    default:
+        assert(0);
+        break;
+    }
+}
+
+void BTL_A3_data::invoke(sSaturnPtr Func, s_workAreaCopy* pParent)
+{
+    switch (Func.m_offset)
+    {
+    case 0x06054b58: // map6
+        Create_BTL_A3_map6(pParent);
+        break;
+    case 0x06054b44: // map3
+        Create_BTL_A3_map3(pParent);
+        break;
+    case 0x06054b4e: // map4
+        Create_BTL_A3_map4(pParent);
+        break;
+    case 0x06054b62: // gnd
+        Create_BTL_A3_gnd(pParent);
+        break;
+    case 0x06054bcc: // wtr
+        Create_BTL_A3_wtr(pParent);
+        break;
+    default:
+        assert(0);
+        break;
+    }
+}
+
+sGenericFormationData* readUrchinFormation(sSaturnPtr ptrEA)
+{
+    sGenericFormationData* pNewData = new sGenericFormationData;
+
+    pNewData->m0_formationSize = readSaturnS8(ptrEA + 0);
+    for (int i = 0; i < 3; i++)
+    {
+        pNewData->m1_perTypeCount[i] = readSaturnS8(ptrEA + 1 + i);
+    }
+
+    for (int i = 0; i < 3; i++)
+    {
+        sSaturnPtr subEntry = readSaturnEA(ptrEA + 4 + i * 4);
+        if(subEntry.m_offset)
+        {
+            sGenericFormationPerTypeData* pSubEntry = new sGenericFormationPerTypeData;
+            pSubEntry->m0_enemyTypeId = readSaturnS8(subEntry + 0);
+            pSubEntry->m1_fileBundleIndex = readSaturnS8(subEntry + 1);
+            pSubEntry->m2 = readSaturnS8(subEntry + 2);
+            pSubEntry->m4 = readSaturnS16(subEntry + 4);
+            pSubEntry->m8_modelOffset = readSaturnU16(subEntry + 8);
+            pSubEntry->mA_poseOffset = readSaturnU16(subEntry + 0xA);
+            pSubEntry->mC_hotspotDefinitions = readRiderDefinitionSub(readSaturnEA(subEntry + 0xC));
+            for (int k = 0; k < 4; k++)
+            {
+                pSubEntry->m10_laserHitQuadrantFlags[k] = readSaturnS8(subEntry + 0x10 + k);
+                pSubEntry->m14_gunHitQuadrantFlags[k] = readSaturnS8(subEntry + 0x14 + k);
+            }
+            pSubEntry->m18_knockbackStrength = readSaturnS8(subEntry + 0x18);
+
+            sSaturnPtr ptrTo1C = readSaturnEA(subEntry + 0x1C);
+            for (int j=0; j<1; j++)
+            {
+                sGenericFormationPerTypeDataSub1C subData1C;
+
+                subData1C.m0 = readSaturnEA(ptrTo1C + 0);
+                for (int k = 0; k < 4; k++)
+                {
+                    sSaturnPtr attackData = readSaturnEA(ptrTo1C + 0x4 + k * 4);
+                    if (attackData.isNull())
+                    {
+                        subData1C.m4[k] = nullptr;
+                    }
+                    else
+                    {
+                        subData1C.m4[k] = new sAttackCommand;
+
+                        subData1C.m4[k]->m0_attackParams = readSaturnEA(attackData + 0);
+                        subData1C.m4[k]->m4_cameraList = readSaturnEA(attackData + 4);
+                        subData1C.m4[k]->m8_type = readSaturnS8(attackData + 8);
+                        subData1C.m4[k]->m9_flags = readSaturnU8(attackData + 9);
+                        subData1C.m4[k]->mA_attackDisplayName = readSaturnS8(attackData + 0xA);
+                    }
+                }
+                subData1C.m14_quadrantFlags[0] = readSaturnS8(ptrTo1C + 0x14 + 0);
+                subData1C.m14_quadrantFlags[1] = readSaturnS8(ptrTo1C + 0x14 + 1);
+                subData1C.m14_quadrantFlags[2] = readSaturnS8(ptrTo1C + 0x14 + 2);
+                subData1C.m14_quadrantFlags[3] = readSaturnS8(ptrTo1C + 0x14 + 3);
+                subData1C.m18_nextAnimIndex[0] = readSaturnS8(ptrTo1C + 0x18 + 0);
+                subData1C.m18_nextAnimIndex[1] = readSaturnS8(ptrTo1C + 0x18 + 1);
+                subData1C.m18_nextAnimIndex[2] = readSaturnS8(ptrTo1C + 0x18 + 2);
+                subData1C.m18_nextAnimIndex[3] = readSaturnS8(ptrTo1C + 0x18 + 3);
+                subData1C.m1C_animationOffset = readSaturnU16(ptrTo1C + 0x1C);
+                subData1C.m1E_quadrantAttackDirections = readSaturnS8(ptrTo1C + 0x1E);
+                subData1C.m20_timerValue = readSaturnU16(ptrTo1C + 0x20);
+                pSubEntry->m1C.push_back(subData1C);
+            }
+
+            sSaturnPtr ptrTo20 = readSaturnEA(subEntry + 0x20);
+            if (ptrTo20.isNull())
+            {
+                pSubEntry->m20_beamHitCounterData = nullptr;
+            }
+            else
+            {
+                pSubEntry->m20_beamHitCounterData = new sGenericFormationPerTypeDataSub1C;
+                sGenericFormationPerTypeDataSub1C& sub20 = *pSubEntry->m20_beamHitCounterData;
+                sub20.m0 = readSaturnEA(ptrTo20 + 0);
+                for (int k = 0; k < 4; k++)
+                {
+                    sSaturnPtr attackData = readSaturnEA(ptrTo20 + 0x4 + k * 4);
+                    if (attackData.isNull())
+                    {
+                        sub20.m4[k] = nullptr;
+                    }
+                    else
+                    {
+                        sub20.m4[k] = new sAttackCommand;
+                        sub20.m4[k]->m0_attackParams = readSaturnEA(attackData + 0);
+                        sub20.m4[k]->m4_cameraList = readSaturnEA(attackData + 4);
+                        sub20.m4[k]->m8_type = readSaturnS8(attackData + 8);
+                        sub20.m4[k]->m9_flags = readSaturnU8(attackData + 9);
+                        sub20.m4[k]->mA_attackDisplayName = readSaturnS8(attackData + 0xA);
+                    }
+                }
+                sub20.m14_quadrantFlags[0] = readSaturnS8(ptrTo20 + 0x14 + 0);
+                sub20.m14_quadrantFlags[1] = readSaturnS8(ptrTo20 + 0x14 + 1);
+                sub20.m14_quadrantFlags[2] = readSaturnS8(ptrTo20 + 0x14 + 2);
+                sub20.m14_quadrantFlags[3] = readSaturnS8(ptrTo20 + 0x14 + 3);
+                sub20.m18_nextAnimIndex[0] = readSaturnS8(ptrTo20 + 0x18 + 0);
+                sub20.m18_nextAnimIndex[1] = readSaturnS8(ptrTo20 + 0x18 + 1);
+                sub20.m18_nextAnimIndex[2] = readSaturnS8(ptrTo20 + 0x18 + 2);
+                sub20.m18_nextAnimIndex[3] = readSaturnS8(ptrTo20 + 0x18 + 3);
+                sub20.m1C_animationOffset = readSaturnU16(ptrTo20 + 0x1C);
+                sub20.m1E_quadrantAttackDirections = readSaturnS8(ptrTo20 + 0x1E);
+                sub20.m20_timerValue = readSaturnU16(ptrTo20 + 0x20);
+            }
+
+            sSaturnPtr ptrTo24 = readSaturnEA(subEntry + 0x24);
+            if (ptrTo24.isNull())
+            {
+                pSubEntry->m24_beamHitAttackData = nullptr;
+            }
+            else
+            {
+                pSubEntry->m24_beamHitAttackData = new sGenericFormationPerTypeDataSub1C;
+                sGenericFormationPerTypeDataSub1C& sub24 = *pSubEntry->m24_beamHitAttackData;
+                sub24.m0 = readSaturnEA(ptrTo24 + 0);
+                for (int k = 0; k < 4; k++)
+                {
+                    sSaturnPtr attackData = readSaturnEA(ptrTo24 + 0x4 + k * 4);
+                    if (attackData.isNull())
+                    {
+                        sub24.m4[k] = nullptr;
+                    }
+                    else
+                    {
+                        sub24.m4[k] = new sAttackCommand;
+                        sub24.m4[k]->m0_attackParams = readSaturnEA(attackData + 0);
+                        sub24.m4[k]->m4_cameraList = readSaturnEA(attackData + 4);
+                        sub24.m4[k]->m8_type = readSaturnS8(attackData + 8);
+                        sub24.m4[k]->m9_flags = readSaturnU8(attackData + 9);
+                        sub24.m4[k]->mA_attackDisplayName = readSaturnS8(attackData + 0xA);
+                    }
+                }
+                sub24.m14_quadrantFlags[0] = readSaturnS8(ptrTo24 + 0x14 + 0);
+                sub24.m14_quadrantFlags[1] = readSaturnS8(ptrTo24 + 0x14 + 1);
+                sub24.m14_quadrantFlags[2] = readSaturnS8(ptrTo24 + 0x14 + 2);
+                sub24.m14_quadrantFlags[3] = readSaturnS8(ptrTo24 + 0x14 + 3);
+                sub24.m18_nextAnimIndex[0] = readSaturnS8(ptrTo24 + 0x18 + 0);
+                sub24.m18_nextAnimIndex[1] = readSaturnS8(ptrTo24 + 0x18 + 1);
+                sub24.m18_nextAnimIndex[2] = readSaturnS8(ptrTo24 + 0x18 + 2);
+                sub24.m18_nextAnimIndex[3] = readSaturnS8(ptrTo24 + 0x18 + 3);
+                sub24.m1C_animationOffset = readSaturnU16(ptrTo24 + 0x1C);
+                sub24.m1E_quadrantAttackDirections = readSaturnS8(ptrTo24 + 0x1E);
+                sub24.m20_timerValue = readSaturnU16(ptrTo24 + 0x20);
+            }
+            pSubEntry->m28[0] = readSaturnS8(subEntry + 0x28 + 0);
+            pSubEntry->m28[1] = readSaturnS8(subEntry + 0x28 + 1);
+            pSubEntry->m28[2] = readSaturnS8(subEntry + 0x28 + 2);
+            pSubEntry->m28[3] = readSaturnS8(subEntry + 0x28 + 3);
+            pSubEntry->m38 = readSaturnS8(subEntry + 0x38);
+            pNewData->m4_perTypeParams[i] = pSubEntry;
+        }
+        else
+        {
+            pNewData->m4_perTypeParams[i] = nullptr;
+        }
+    }
+
+    sSaturnPtr positionTableTable = readSaturnEA(ptrEA + 0x10);
+    do 
+    {
+        sSaturnPtr positionTable = readSaturnEA(positionTableTable);
+        if (!positionTable.isNull())
+        {
+            sGenericFormationSubData* pNewFormation = new sGenericFormationSubData;
+            for (int i = 0; i < pNewData->m0_formationSize; i++)
+            {
+                pNewFormation->m0_perEnemyPosition.push_back(readSaturnVec3(positionTable + i * 0xC));
+            }
+            pNewData->m10_formationSubData.push_back(pNewFormation);
+        }
+        else
+        {
+            pNewData->m10_formationSubData.push_back(nullptr);
+            break;
+        }
+        positionTableTable += 4;
+    } while (1);
+
+    pNewData->m14 = readSaturnS8(ptrEA + 0x14);
+    pNewData->m15_formationNameIndex = readSaturnS8(ptrEA + 0x15);
+    pNewData->m16 = readSaturnS8(ptrEA + 0x16);
+    pNewData->m17 = readSaturnS8(ptrEA + 0x17);
+
+    for (int i = 0; i < 3; i++)
+    {
+        pNewData->m18_initialDirections[i] = readSaturnS8(ptrEA + 0x18 + i);
+    }
+
+    pNewData->m1C = readSaturnS32(ptrEA + 0x1C);
+
+    for (int i = 0; i < 3; i++)
+    {
+        pNewData->m20_deathSoundEffect[i] = readSaturnS8(ptrEA + 0x20 + i);
+    }
+
+    return pNewData;
+}
+
+p_workArea BTL_A3_data::invokeCreateEffect(sSaturnPtr Func, s_workAreaCopy* pParent)
+{
+    switch (Func.m_offset)
+    {
+    case 0x06054db0:
+        return createPattergoHealerParticleEffect(pParent);
+    case 0x0605699c:
+        return createPattergoMultiParticleEffect(pParent);
+    case 0x06054dce:
+        return urchinAttack_spawnProjectile(pParent);
+    default:
+        assert(0);
+        return nullptr;
+    }
+}
+
+BTL_A3_data::BTL_A3_data() : battleOverlay("BTL_A3.PRG")
+{
+    m_map3 = readGrid(getSaturnPtr(0x60a5c78), 2, 2);
+    m_map4 = readGrid(getSaturnPtr(0x60a605c), 2, 2);
+    m_map6 = readGrid(getSaturnPtr(0x60a6698), 2, 2);
+
+    m_60A8AE8_urchinFormation = readUrchinFormation(getSaturnPtr(0x60A8AE8));
+    m_60a8ac4_urchinFormation = readUrchinFormation(getSaturnPtr(0x60a8ac4));
+    m_60a7d34_urchinFormation = readUrchinFormation(getSaturnPtr(0x60a7d34));
+    m_60a7d58_urchinFormation = readUrchinFormation(getSaturnPtr(0x60a7d58));
+}
+

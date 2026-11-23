@@ -1,0 +1,143 @@
+#include "PDS.h"
+#include "excaEntity.h"
+#include "town/town.h"
+#include "kernel/fileBundle.h"
+#include "kernel/animation.h"
+
+struct sGenericTownNPC : public s_workAreaTemplateWithArgAndBase<sGenericTownNPC, sTownObject, sSaturnPtr>
+{
+    static TypedTaskDefinition* getTypedTaskDefinition()
+    {
+        static TypedTaskDefinition taskDefinition = { &sGenericTownNPC::Init, &sGenericTownNPC::Update, nullptr, &sGenericTownNPC::Delete };
+        return &taskDefinition;
+    }
+
+    static void Init(sGenericTownNPC* pThis, sSaturnPtr arg)
+    {
+        pThis->mC = arg;
+        pThis->mC4_position = readSaturnVec3(arg + 8);
+        pThis->mD0_rotation = readSaturnVec3(arg + 0x14);
+        pThis->mDC_status = readSaturnU8(arg + 0x26);
+
+        s16 npcIndex = readSaturnS16(arg + 0x2c);
+        if (npcIndex > -1) {
+            npcData0.m70_npcPointerArray[npcIndex].workArea = pThis;
+        }
+    }
+
+    static void Update(sGenericTownNPC* pThis)
+    {
+        s32 fileIndex = readSaturnU32(pThis->mC);
+        if (isDataLoaded(fileIndex))
+        {
+            s16 modelIndex = readSaturnS16(pThis->mC + 0x20);
+            s16 animationIndex = readSaturnS16(pThis->mC + 0x22);
+            s16 poseIndex = readSaturnS16(pThis->mC + 0x24);
+
+            sModelHierarchy* pHierarchy = pThis->m0_fileBundle->getModelHierarchy(modelIndex);
+            sStaticPoseData* pPose = pThis->m0_fileBundle->getStaticPose(poseIndex, pHierarchy->countNumberOfBones());
+
+            if (animationIndex == 0)
+            {
+                init3DModelRawData(pThis, &pThis->m10_3dModel, 0, pThis->m0_fileBundle, modelIndex, nullptr, pPose, nullptr, nullptr);
+            }
+            else
+            {
+                sAnimationData* pAnimation = pThis->m0_fileBundle->getAnimation(animationIndex);
+                init3DModelRawData(pThis, &pThis->m10_3dModel, 0, pThis->m0_fileBundle, modelIndex, pAnimation, pPose, nullptr, nullptr);
+                stepAnimation(&pThis->m10_3dModel);
+            }
+
+            sSaturnPtr scriptConfigEA = readSaturnEA(pThis->mC + 0x28);
+            if (!scriptConfigEA.isNull())
+            {
+                pThis->m60_scriptContext.m30_pPosition = &pThis->mC4_position;
+                pThis->m60_scriptContext.m34_pRotation = &pThis->mD0_rotation;
+                pThis->m60_scriptContext.m38_pOwner = pThis;
+                pThis->m60_scriptContext.m3C_scriptEA = readSaturnEA(scriptConfigEA + 4);
+
+                s16 sVar1 = readSaturnS16(scriptConfigEA + 2);
+                sProcessed3dModel* puVar3 = nullptr;
+                if (sVar1)
+                {
+                    puVar3 = (sProcessed3dModel*)((u8*)pThis->m0_fileBundle + sVar1);
+                }
+
+                pThis->m60_scriptContext.m40 = puVar3;
+
+                setCollisionSetup(&pThis->m60_scriptContext, readSaturnU8(scriptConfigEA + 0));
+                setCollisionBounds(&pThis->m60_scriptContext, readSaturnVec3(scriptConfigEA + 0x8), readSaturnVec3(scriptConfigEA + 0x14));
+            }
+
+            pThis->m_UpdateMethod = &sGenericTownNPC::Update2;
+            pThis->m_DrawMethod = &sGenericTownNPC::Draw2;
+        }
+    }
+
+    static void Update2(sGenericTownNPC* pThis)
+    {
+        switch (pThis->mDC_status)
+        {
+        case 0:
+            break;
+        case 1:
+        {
+            stepAnimation(&pThis->m10_3dModel);
+            int numFrames = 0;
+            if (pThis->m10_3dModel.m30_pCurrentAnimation)
+            {
+                numFrames = pThis->m10_3dModel.m30_pCurrentAnimation->m4_numFrames;
+            }
+            if (numFrames - 1 <= pThis->m10_3dModel.m16_previousAnimationFrame)
+            {
+                pThis->mDC_status = 0;
+            }
+            break;
+        }
+        case 2:
+            stepAnimation(&pThis->m10_3dModel);
+            break;
+        case 3:
+            removeNPC(pThis, pThis, pThis->mC);
+            break;
+        default:
+            assert(0);
+            break;
+        }
+
+        // don't update if there is no script config
+        if (readSaturnEA(pThis->mC + 0x28).isNull())
+            return;
+
+        registerCollisionBody(&pThis->m60_scriptContext);
+    }
+
+    static void Draw2(sGenericTownNPC* pThis)
+    {
+        pushCurrentMatrix();
+        translateCurrentMatrix(pThis->mC4_position);
+        rotateCurrentMatrixZYX(pThis->mD0_rotation);
+        pThis->m10_3dModel.m18_drawFunction(&pThis->m10_3dModel);
+        popMatrix();
+    }
+
+    static void Delete(sGenericTownNPC* pThis)
+    {
+        s16 npcIndex = readSaturnS16(pThis->mC + 0x2C);
+        if (npcIndex > -1 && npcData0.m70_npcPointerArray[npcIndex].workArea == pThis) {
+            npcData0.m70_npcPointerArray[npcIndex].workArea = nullptr;
+        }
+    }
+
+    sSaturnPtr mC;
+    s_3dModel m10_3dModel;
+    sCollisionBody m60_scriptContext;
+    sVec3_FP mC4_position;
+    sVec3_FP mD0_rotation;
+    u8 mDC_status;
+    //size: 0xE0
+};
+
+sTownObject* createExcaEntity(npcFileDeleter* parent, sSaturnPtr arg) {
+    return createSubTaskWithArgWithCopy<sGenericTownNPC, sSaturnPtr>((s_workAreaCopy*)parent, arg);
+}

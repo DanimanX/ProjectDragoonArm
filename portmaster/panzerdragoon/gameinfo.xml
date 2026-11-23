@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<gameList>
+  <game>
+    <path>./Panzer Dragoon Saga.sh</path>
+    <name>Panzer Dragoon Saga</name>
+    <desc>Panzer Dragoon Saga (Sega Saturn, 1998) running natively on ARM64 through the reverse-engineered Azel engine, with Saturn VDP1/VDP2 translated to OpenGL ES 3. No emulation. Supply your own disc dump.</desc>
+    <image>./panzerdragoon/cover.jpg</image>
+    <rating>0.9</rating>
+    <releasedate>19980301T000000</releasedate>
+    <developer>Team Andromeda</developer>
+    <publisher>SEGA</publisher>
+    <genre>Role Playing Game</genre>
+    <players>1</players>
+  </game>
+</gameList>

@@ -1,0 +1,959 @@
+#include "PDS.h"
+#include "town.h"
+#include "townMainLogic.h"
+#include "townEdge.h"
+#include "townLCS.h"
+#include "ruin/twn_ruin.h"
+#include "kernel/debug/trace.h"
+#include "townScript.h"
+#include "collisionRegistry.h"
+
+sMainLogic* twnMainLogicTask;
+
+// 06055db2 (RUIN), 0606b396 (CAMP), 0606f44e (CARA), 06097772 (ZOAH)
+void mainLogicDummy(struct sMainLogic*)
+{
+}
+
+// 0606c952 (CAMP), 06070a0a (CARA), 06098d2e (ZOAH)
+s32 disableCameraUpdate()
+{
+    twnMainLogicTask->m10 = &mainLogicDummy;
+    return 0;
+}
+
+void initTownProjection()
+{
+    initVDP1Projection(DEG_80 / 2, 0);
+}
+
+// read inputs
+void readPlayerInput(sMainLogic* pThis)
+{
+    if (!(npcData0.mFC & 8))
+    {
+        if (npcData0.mFC & 0x10)
+        {
+            if (graphicEngineStatus.m4514.m0_inputDevices[0].m0_current.m8_newButtonDown & 1)
+            {
+                pThis->m4_flags |= 0x4000000;
+            }
+        }
+        else
+        {
+            //605578C
+            if (graphicEngineStatus.m4514.m0_inputDevices[0].m0_current.m8_newButtonDown & graphicEngineStatus.m4514.mD8_buttonConfig[0][2])
+            {
+                pThis->m4_flags |= 0x8000000;
+            }
+        }
+    }
+
+    //0x60557A0
+    if (graphicEngineStatus.m4514.m0_inputDevices[0].m0_current.m8_newButtonDown & graphicEngineStatus.m4514.mD8_buttonConfig[0][13])
+    {
+        pThis->m4_flags |= 0x20000000;
+    }
+
+    s32 r6 = 0;
+    s32 r7 = 0;
+    if (graphicEngineStatus.m4514.m0_inputDevices[0].m0_current.m0_inputType == 2)
+    {
+        //60557BA
+        r6 = graphicEngineStatus.m4514.m0_inputDevices[0].m0_current.m2_analogX * 512;
+        if (graphicEngineStatus.m4514.m138[0]) // inverse axis
+        {
+            r7 = -graphicEngineStatus.m4514.m0_inputDevices[0].m0_current.m3_analogY * 512;
+        }
+        else
+        {
+            r7 = graphicEngineStatus.m4514.m0_inputDevices[0].m0_current.m3_analogY * 512;
+        }
+    }
+    else
+    {
+        if (graphicEngineStatus.m4514.m0_inputDevices[0].m0_current.m6_buttonDown & graphicEngineStatus.m4514.mD8_buttonConfig[0][4])
+        {
+            r6 = 0;
+            r7 = 0x10000;
+        }
+        else if (graphicEngineStatus.m4514.m0_inputDevices[0].m0_current.m6_buttonDown & graphicEngineStatus.m4514.mD8_buttonConfig[0][5])
+        {
+            r6 = 0;
+            r7 = -0x10000;
+        }
+
+        if (graphicEngineStatus.m4514.m0_inputDevices[0].m0_current.m6_buttonDown & graphicEngineStatus.m4514.mD8_buttonConfig[0][6])
+        {
+            r6 = 0x10000;
+            r7 = 0;
+        }
+        else if (graphicEngineStatus.m4514.m0_inputDevices[0].m0_current.m6_buttonDown & graphicEngineStatus.m4514.mD8_buttonConfig[0][7])
+        {
+            r6 = -0x10000;
+            r7 = -0;
+        }
+    }
+
+    //6055820
+    pThis->m8_inputX = r6;
+    pThis->mC_inputY = r7;
+}
+
+void processInputFlags(sMainLogic* pThis)
+{
+    if (pThis->m4_flags & 0x4000000)
+    {
+        // cancel LCS
+        npcData0.mFC &= ~0x12;
+        graphicEngineStatus.m40AC.m1_isMenuAllowed = 1;
+    }
+    else if ((pThis->m4_flags & 0x8000000) && !(npcData0.mFC & 0x10))
+    {
+        // enter LCS
+        npcData0.mFC |= 0x12;
+        graphicEngineStatus.m40AC.m1_isMenuAllowed = 0;
+        LCSCollisionData.m4_LCS_Y = 0;
+        LCSCollisionData.m0_LCS_X = 0;
+        pThis->m3 = 0;
+        pThis->m30 = pThis->m68_cameraRotation[1];
+    }
+
+    //60558AE
+    if (pThis->m4_flags & 0x10000000)
+    {
+        assert(0);
+    }
+
+    if (pThis->m4_flags & 0x40000000)
+    {
+        pThis->m0 ^= 1;
+    }
+}
+
+void updateAutoWalk(sMainLogic* pThis)
+{
+    if (pThis->m14_EdgeTask)
+    {
+        sNPCE8* r5 = &pThis->m14_EdgeTask->mE8;
+        if (pThis->m118_autoWalkDuration)
+        {
+            if (--pThis->m118_autoWalkDuration == 0)
+            {
+                pThis->m14_EdgeTask->m84.m0_collisionSetup.m0_collisionType = 0;
+            }
+
+            pThis->m11C_autoWalkStartPosition += pThis->m134_autoWalkPositionStep;
+            pThis->m14_EdgeTask->mE8.m0_position = pThis->m11C_autoWalkStartPosition;
+            pThis->m14_EdgeTask->mE8.mC_rotation = pThis->m128_autoWalkStartRotation;
+        }
+    }
+}
+
+
+
+void scriptFunction_6057058_sub0Sub0()
+{
+    sNPCE8* r13 = &twnMainLogicTask->m14_EdgeTask->mE8;
+    twnMainLogicTask->m18_position = r13->m0_position + sVec3_FP(0, 0x1800, 0);
+
+    sMatrix4x3 var0;
+    initMatrixToIdentity(&var0);
+    translateMatrix(twnMainLogicTask->m18_position, &var0);
+    rotateMatrixShiftedY(r13->mC_rotation[1], &var0);
+    rotateMatrixShiftedX(r13->mC_rotation[0], &var0);
+
+    twnMainLogicTask->m5C_rawCameraPosition[0] = var0.m[0][3] + MTH_Mul(var0.m[0][2], 0x199);
+    twnMainLogicTask->m5C_rawCameraPosition[1] = var0.m[1][3] + MTH_Mul(var0.m[1][2], 0x199);
+    twnMainLogicTask->m5C_rawCameraPosition[2] = var0.m[2][3] + MTH_Mul(var0.m[2][2], 0x199);
+
+    twnMainLogicTask->m38_interpolatedCameraPosition = twnMainLogicTask->m5C_rawCameraPosition;
+    twnMainLogicTask->m50_upVector = twnMainLogicTask->m5C_rawCameraPosition;
+    twnMainLogicTask->m50_upVector[1] += 0x10000;
+
+    twnMainLogicTask->m44_cameraTarget[0] = var0.m[0][3] + MTH_Mul(var0.m[0][2], -0x1000);
+    twnMainLogicTask->m44_cameraTarget[1] = var0.m[1][3] + MTH_Mul(var0.m[1][2], -0x1000);
+    twnMainLogicTask->m44_cameraTarget[2] = var0.m[2][3] + MTH_Mul(var0.m[2][2], -0x1000);
+}
+
+void moveTownLCSCursor(sMainLogic* r4)
+{
+    LCSCollisionData.m0_LCS_X += MTH_Mul(0x50000, -r4->m8_inputX);
+    if (LCSCollisionData.m0_LCS_X > 0x7428F5)
+    {
+        LCSCollisionData.m0_LCS_X = 0x7428F5;
+    }
+    if (LCSCollisionData.m0_LCS_X < -0x7428F5)
+    {
+        LCSCollisionData.m0_LCS_X = -0x7428F5;
+    }
+
+    LCSCollisionData.m4_LCS_Y += MTH_Mul(0x50000, r4->mC_inputY);
+    if (LCSCollisionData.m4_LCS_Y > 0x49EB85)
+    {
+        LCSCollisionData.m4_LCS_Y = 0x49EB85;
+    }
+    if (LCSCollisionData.m4_LCS_Y < -0x49EB85)
+    {
+        LCSCollisionData.m4_LCS_Y = -0x49EB85;
+    }
+}
+
+const std::array<sVec2_FP, 2> cameraParams = {
+    {
+        {0x2CCC, 0xAAAAAA},
+        {0x2CCC, -0x555555},
+    }
+};
+
+// 06055be4
+void cameraUpdate_follow_LCSSub1(sMainLogic* r4)
+{
+    const sVec3_FP* r13 = &r4->m18_position;
+    if ((npcData0.mFC & 1) && (currentResTask->m8_currentLCSType))
+    {
+        if (currentResTask->m8_currentLCSType == 1)
+        {
+            r13 = getEnvLCSTargetPosition(currentResTask->mC_AsIndex);
+        }
+        else
+        {
+            r13 = &currentResTask->mC->m8_position;
+        }
+
+        if (r4->m3 == 0)
+        {
+            sVec3_FP diff = r4->m14_EdgeTask->m84.m8_position - *r13;
+
+            s32 angle = atan2_FP((s32)diff[0], (s32)diff[2]);
+            u32 angleDiff = (angle - (s32)r4->m68_cameraRotation[1]) & 0xFFFFFFF;
+
+            fixedPoint dist = sqrt_F(MTH_Product3d_FP(diff, diff));
+            if ((s32)dist < 0x1000) dist = 0x1000;
+
+            s32 threshold = FP_Div(0x2AAAAAA, (s32)dist << 4) + 0x222222;
+
+            if ((s32)angleDiff < threshold)
+            {
+                r4->m30 = angle - threshold;
+            }
+            if ((s32)angleDiff > 0x10000000 - threshold)
+            {
+                r4->m30 = angle + threshold;
+            }
+            r4->m3 = 1;
+        }
+    }
+
+    r4->m44_cameraTarget[0] = MTH_Mul(r4->m44_cameraTarget[0] - (*r13)[0], 0xF333) + (*r13)[0];
+    r4->m44_cameraTarget[1] = MTH_Mul(r4->m44_cameraTarget[1] - (*r13)[1], 0xF333) + (*r13)[1];
+    r4->m44_cameraTarget[2] = MTH_Mul(r4->m44_cameraTarget[2] - (*r13)[2], 0xF333) + (*r13)[2];
+}
+
+void cameraUpdate_follow_LCS(sMainLogic* r14_pose)
+{
+    sNPCE8* r12_npcData = &r14_pose->m14_EdgeTask->mE8;
+
+    r14_pose->m68_cameraRotation[0] += MTH_Mul(0xE38E3, r14_pose->mC_inputY);
+    if (r14_pose->m68_cameraRotation[0] > 0x13E93E9)
+    {
+        r14_pose->m68_cameraRotation[0] = 0x13E93E9;
+    }
+    if (r14_pose->m68_cameraRotation[0] < -0x13E93E9)
+    {
+        r14_pose->m68_cameraRotation[0] = -0x13E93E9;
+    }
+
+    r14_pose->m30 += MTH_Mul(0xE38E3, r14_pose->m8_inputX);
+
+    if (!(npcData0.mFC & 1))
+    {
+        if (graphicEngineStatus.m4514.m0_inputDevices[0].m0_current.m8_newButtonDown & graphicEngineStatus.m4514.mD8_buttonConfig[0][11])
+        {
+            r14_pose->m30 = ((r14_pose->m68_cameraRotation[1] - r12_npcData->mC_rotation[1] + 0x5000000) & 0xC000000) + r12_npcData->mC_rotation[1];
+        }
+        else if (graphicEngineStatus.m4514.m0_inputDevices[0].m0_current.m8_newButtonDown & graphicEngineStatus.m4514.mD8_buttonConfig[0][15])
+        {
+            //060561D4
+            r14_pose->m30 = ((r14_pose->m68_cameraRotation[1] - r12_npcData->mC_rotation[1] - 0x1000000) & 0xC000000) + r12_npcData->mC_rotation[1];
+        }
+
+    }
+    //60561E6
+    r14_pose->m68_cameraRotation[1] += MTH_Mul(fixedPoint(r14_pose->m30 - r14_pose->m68_cameraRotation[1]).normalized(), 0x1999);
+    moveTownLCSCursor(r14_pose);
+    r14_pose->m24_distance = vecDistance(r14_pose->m18_position, r14_pose->m5C_rawCameraPosition);
+    fixedPoint r4 = MTH_Mul(cameraParams[r14_pose->m1_cameraParamsIndex][0] - r14_pose->m24_distance, 0x1999);
+    if (r4 > 0x599)
+    {
+        r4 = 0x599;
+    }
+    if (r4 < -0x599)
+    {
+        r4 = -0x599;
+    }
+    r14_pose->m24_distance += r4;
+
+    sMatrix4x3 var4;
+    initMatrixToIdentity(&var4);
+    rotateMatrixShiftedY(r14_pose->m68_cameraRotation[1], &var4);
+    rotateMatrixShiftedX(r14_pose->m68_cameraRotation[0], &var4);
+    scaleMatrixRow2(r14_pose->m24_distance, &var4);
+
+    r14_pose->m38_interpolatedCameraPosition[0] = var4.m[0][2] + r14_pose->m18_position[0];
+    r14_pose->m38_interpolatedCameraPosition[1] = var4.m[1][2] + r14_pose->m18_position[1];
+    r14_pose->m38_interpolatedCameraPosition[2] = var4.m[2][2] + r14_pose->m18_position[2];
+
+    r14_pose->m5C_rawCameraPosition = r14_pose->m38_interpolatedCameraPosition;
+
+    cameraUpdate_follow_LCSSub1(r14_pose);
+}
+
+void updateCameraTarget(sMainLogic* r4, const sVec3_FP& r14_pose)
+{
+    // project the point to screen
+
+    sVec3_FP var8;
+    var8[0] = transformByMatrixRow0(r14_pose);
+    var8[1] = transformByMatrixRow1(r14_pose);
+    var8[2] = transformByMatrixRow2(r4->m18_position); // original projects m18_position for Z, not r14_pose
+
+    sVec2_FP var0;
+    var0[0] = FP_Div(var8[0], var8[2]);
+    var0[1] = FP_Div(var8[1], var8[2]);
+
+    if (var0[0] < 0)
+    {
+        var0[0] = -var0[0];
+    }
+
+    if (var0[1] < 0)
+    {
+        var0[1] = -var0[1];
+    }
+
+    // If the projected target point is already at the center of the screen
+    if ((MTH_Mul(graphicEngineStatus.m405C.m18_widthScale, var0[0]) == 0) && (MTH_Mul(graphicEngineStatus.m405C.m1C_heightScale, var0[1]) == 0))
+    {
+        r4->m44_cameraTarget = r14_pose;
+        return;
+    }
+
+    // If not, interpolate
+    if (var0[0] > 0x800000)
+        var0[0] = 0x800000;
+
+    if (var0[1] > 0x800000)
+        var0[1] = 0x800000;
+
+    fixedPoint r13 = MulVec2(var0, var0) / 2;
+
+    if (r13 > 0xB333)
+        r13 = 0xB333;
+
+    if (r13 < 0xCCC)
+        r13 = 0xCCC;
+
+    r13 = 0x10000 - r13;
+
+    r4->m44_cameraTarget[0] = r14_pose[0] + MTH_Mul(r4->m44_cameraTarget[0] - r14_pose[0], r13);
+    r4->m44_cameraTarget[1] = r14_pose[1] + MTH_Mul(r4->m44_cameraTarget[1] - r14_pose[1], r13);
+    r4->m44_cameraTarget[2] = r14_pose[2] + MTH_Mul(r4->m44_cameraTarget[2] - r14_pose[2], r13);
+}
+
+void updateFollowCameraTarget(sMainLogic* r4)
+{
+    sMatrix4x3 varC;
+
+    const sNPCE8& r13 = r4->m14_EdgeTask->mE8;
+
+    initMatrixToIdentity(&varC);
+    rotateMatrixShiftedY(r13.m24_stepRotation[1] + r13.mC_rotation[1], &varC);
+    rotateMatrixShiftedX(r13.m24_stepRotation[0] + r13.mC_rotation[0], &varC);
+    scaleMatrixRow2((-r4->m24_distance).asS32() >> 1, &varC); // original: -m24_distance >> 1 (arithmetic floor, not /2 trunc)
+
+    sVec3_FP var0;
+    var0[0] = varC.m[0][2] + r4->m18_position[0];
+    var0[1] = varC.m[1][2] + r4->m18_position[1];
+    var0[2] = varC.m[2][2] + r4->m18_position[2];
+
+    updateCameraTarget(r4, var0);
+}
+
+void cameraUpdate_follow(sMainLogic* r14_townTask)
+{
+    sEdgeTask* r4_edge = r14_townTask->m14_EdgeTask;
+    sNPCE8* r13_npcData = &r4_edge->mE8;
+
+    if ((r4_edge->mC & 4) == 0)
+    {
+        r14_townTask->m2C = 0;
+        r14_townTask->m30 = 0;
+        if (graphicEngineStatus.m4514.m0_inputDevices[0].m0_current.m6_buttonDown & graphicEngineStatus.m4514.mD8_buttonConfig[0][11])
+        {
+            r14_townTask->m30 = 0x4000000;
+            if (graphicEngineStatus.m4514.m0_inputDevices[0].m0_current.m6_buttonDown & graphicEngineStatus.m4514.mD8_buttonConfig[0][15])
+            {
+                r14_townTask->m30 = 0x8000000;
+            }
+        }
+        else
+        {
+            if (graphicEngineStatus.m4514.m0_inputDevices[0].m0_current.m6_buttonDown & graphicEngineStatus.m4514.mD8_buttonConfig[0][15])
+            {
+                r14_townTask->m30 = 0xC000000;
+            }
+        }
+
+        if (r14_townTask->m4_flags & 0x20000000)
+        {
+            r14_townTask->m1_cameraParamsIndex++;
+            if (r14_townTask->m1_cameraParamsIndex > 1)
+            {
+                r14_townTask->m1_cameraParamsIndex = 0;
+            }
+            if (r14_townTask->m1_cameraParamsIndex == 0)
+            {
+                mainGameState.bitField[0x274] &= 0xFE;
+            }
+            else
+            {
+                mainGameState.bitField[0x274] |= 1;
+            }
+        }
+    }
+
+    //6055E90
+    const sVec2_FP& cameraParam = cameraParams[r14_townTask->m1_cameraParamsIndex];
+    if ((r14_townTask->m24_distance < MTH_Mul(0x151EB, cameraParam[0])) && !(r14_townTask->m4_flags & 0x10000))
+    {
+        if (!(r4_edge->mC & 4))
+        {
+            //06055EBE
+            (*r14_townTask->m74_townCamera.m30_pPosition)[0] += r14_townTask->m74_townCamera.m58_collisionSolveTranslation[0];
+        }
+
+        (*r14_townTask->m74_townCamera.m30_pPosition)[1] += r14_townTask->m74_townCamera.m58_collisionSolveTranslation[1];
+        (*r14_townTask->m74_townCamera.m30_pPosition)[2] += r14_townTask->m74_townCamera.m58_collisionSolveTranslation[2];
+    }
+
+    //6055EE4
+    sVec3_FP var4 = r14_townTask->m18_position - r14_townTask->m5C_rawCameraPosition;
+    r14_townTask->m24_distance = sqrt_F(MTH_Product3d_FP(var4, var4));
+
+    computeLookAt(var4, r14_townTask->m68_cameraRotation);
+    r14_townTask->m68_cameraRotation[2] = 0;
+
+    s32 r4 = atan2_FP(0x147, r14_townTask->m24_distance);
+    if (r4 > 0x1555555)
+    {
+        r4 = 0x1555555;
+    }
+
+    fixedPoint r5 = cameraParam[1] - r14_townTask->m68_cameraRotation[0];
+    fixedPoint r6 = r5.normalized();
+
+    r5 = -r4;
+    if (r6 > r4)
+    {
+        r6 = r4;
+    }
+
+    if (r6 < r5)
+    {
+        r6 = r5;
+    }
+
+    r14_townTask->m68_cameraRotation[0] += r6;
+
+    fixedPoint r3 = r14_townTask->m68_cameraRotation[0];
+    if (r3 > 0x13E93E9)
+    {
+        r14_townTask->m68_cameraRotation[0] = 0x13E93E9;
+    }
+    if (r3 < -0x13E93E9)
+    {
+        r14_townTask->m68_cameraRotation[0] = -0x13E93E9;
+    }
+
+    r6 = r13_npcData->mC_rotation[1] + r14_townTask->m30 - r14_townTask->m68_cameraRotation[1];
+    r6 = r6.normalized();
+
+    if (((r6 < 0x71C71C7) && (r6 > -0x71C71C7)) || (r13_npcData->m54_oldPosition == r13_npcData->m0_position))
+    {
+        // 6055FFA
+        if (r6 > r4)
+            r6 = r4;
+        if (r6 < r5)
+            r6 = r5;
+
+        r14_townTask->m68_cameraRotation[1] += r6;
+    }
+
+    // 605600E
+    r4 = MTH_Mul(cameraParam[0] - r14_townTask->m24_distance, 0x3333);
+    if (r4 > 0x599)
+        r4 = 0x599;
+    if (r4 < -0x599)
+        r4 = -0x599;
+
+    r14_townTask->m24_distance += r4;
+
+    fixedPoint r13;
+    if (r14_townTask->m24_distance >= cameraParam[0])
+    {
+        r13 = 0xCCCC;
+    }
+    else
+    {
+        r13 = setDividend(r14_townTask->m24_distance - 0x1000, 0xCCCC, cameraParam[0] - 0x1000);
+        if (r13 < 0)
+            r13 = 0;
+    }
+
+    //6056078
+    sMatrix4x3 var10;
+    initMatrixToIdentity(&var10);
+    rotateMatrixShiftedY(r14_townTask->m68_cameraRotation[1], &var10);
+    rotateMatrixShiftedX(r14_townTask->m68_cameraRotation[0], &var10);
+    scaleMatrixRow2(r14_townTask->m24_distance, &var10);
+
+    r14_townTask->m5C_rawCameraPosition[0] = var10.m[0][2] + r14_townTask->m18_position[0];
+    r14_townTask->m5C_rawCameraPosition[1] = var10.m[1][2] + r14_townTask->m18_position[1];
+    r14_townTask->m5C_rawCameraPosition[2] = var10.m[2][2] + r14_townTask->m18_position[2];
+
+    r14_townTask->m38_interpolatedCameraPosition[0] = r14_townTask->m5C_rawCameraPosition[0] + MTH_Mul(r14_townTask->m38_interpolatedCameraPosition[0] - r14_townTask->m5C_rawCameraPosition[0], r13);
+    r14_townTask->m38_interpolatedCameraPosition[1] = r14_townTask->m5C_rawCameraPosition[1] + MTH_Mul(r14_townTask->m38_interpolatedCameraPosition[1] - r14_townTask->m5C_rawCameraPosition[1], r13);
+    r14_townTask->m38_interpolatedCameraPosition[2] = r14_townTask->m5C_rawCameraPosition[2] + MTH_Mul(r14_townTask->m38_interpolatedCameraPosition[2] - r14_townTask->m5C_rawCameraPosition[2], r13);
+
+    registerCollisionBody(&r14_townTask->m74_townCamera);
+    updateFollowCameraTarget(r14_townTask);
+}
+
+void cameraUpdate_fixedSubSub(sMainLogic* param_1, sVec3_FP* param_2) {
+    sVec3_FP temp0;
+    temp0[0] = transformByMatrixRow0(*param_2);
+    temp0[1] = transformByMatrixRow1(*param_2);
+    temp0[2] = transformByMatrixRow2(param_1->m18_position);
+
+    sVec2_FP local_2c;
+    local_2c[0] = FP_Div(temp0[0], temp0[2]);
+    local_2c[1] = FP_Div(temp0[1], temp0[2]);
+    if (local_2c[0] < 0) {
+        local_2c[0] = -local_2c[0];
+    }
+    if (local_2c[1] < 0) {
+        local_2c[1] = -local_2c[1];
+    }
+
+    if ((MTH_Mul(graphicEngineStatus.m405C.m18_widthScale, local_2c[0]) == 0) && (MTH_Mul(graphicEngineStatus.m405C.m1C_heightScale, local_2c[1]) == 0)) {
+        param_1->m44_cameraTarget = *param_2;
+    }
+    else {
+        if (0x800000 < local_2c[0]) {
+            local_2c[0] = 0x800000;
+        }
+        if (0x800000 < local_2c[1]) {
+            local_2c[1] = 0x800000;
+        }
+        fixedPoint iVar2 = MulVec2(local_2c, local_2c);
+        fixedPoint iVar1 = iVar2 >> 1;
+        if (0xb333 < iVar1) {
+            iVar1 = 0xb333;
+        }
+        if (iVar1 < 0xccc) {
+            iVar1 = 0xccc;
+        }
+        iVar1 = 0x10000 - iVar1;
+
+        param_1->m44_cameraTarget = MTH_Mul(param_1->m44_cameraTarget - *param_2, iVar1) + *param_2;
+    }
+
+}
+
+void cameraUpdate_fixedSub(sMainLogic* pThis) {
+    sVec3_FP delta = pThis->m18_position - pThis->m5C_rawCameraPosition;
+    fixedPoint distance = sqrt_F(MTH_Product3d_FP(delta, delta));
+
+    fixedPoint scale = -distance / 4;
+
+    if (scale > -0x800) {
+        scale = -0x800;
+    }
+
+    if (scale < -0x2800) {
+        scale = -0x2800;
+    }
+
+    sMatrix4x3 auStack_40;
+    initMatrixToIdentity(&auStack_40);
+    rotateMatrixShiftedY(pThis->m14_EdgeTask->mE8.mC_rotation[1], &auStack_40);
+    rotateMatrixShiftedX(pThis->m14_EdgeTask->mE8.mC_rotation[0], &auStack_40);
+    scaleMatrixRow2(scale, &auStack_40);
+
+    sVec3_FP local_58;
+    local_58.m0_X = auStack_40.m[0][2] + (pThis->m18_position).m0_X;
+    local_58.m4_Y = auStack_40.m[1][2] + (pThis->m18_position).m4_Y;
+    local_58.m8_Z = auStack_40.m[2][2] + (pThis->m18_position).m8_Z;
+    cameraUpdate_fixedSubSub(pThis, &local_58);
+}
+
+void cameraUpdate_fixed(sMainLogic* pThis) {
+
+    bool isClamped = false;
+
+    cameraUpdate_fixedSub(pThis);
+
+    sVec3_FP delta = pThis->m44_cameraTarget - pThis->m5C_rawCameraPosition;
+    pThis->m24_distance = sqrt_F(MTH_Product3d_FP(delta, delta));
+
+    computeLookAt(delta, pThis->m68_cameraRotation);
+
+    pThis->m68_cameraRotation.m8_Z = 0;
+
+    {
+        fixedPoint temp1 = (pThis->m68_cameraRotation[0] - pThis->mF0[0]) & 0xfffffff;
+        fixedPoint temp2 = (pThis->mF8[0] - pThis->mF0[0]) & 0xfffffff;
+
+        if (temp2 < temp1) {
+            isClamped = true;
+            if ((temp2 / 2) + 0x8000000U < temp1) {
+                pThis->m68_cameraRotation[0] = pThis->mF0[0];
+            }
+            else {
+                pThis->m68_cameraRotation[0] = pThis->mF8[0];
+            }
+        }
+    }
+
+    {
+        fixedPoint temp2 = (pThis->m68_cameraRotation[1] - pThis->mF0[1]) & 0xfffffff;
+        fixedPoint temp1 = (pThis->mF8[1] - pThis->mF0[1]) & 0xfffffff;
+        if (temp1 < temp2) {
+            fixedPoint temp3;
+            fixedPoint temp4;
+            if ((temp1 / 2) + 0x8000000U < temp2) {
+                (pThis->m68_cameraRotation)[1] = pThis->mF0[1];
+                temp3 = -(pThis->m10C)[1];
+                temp4 = (pThis->m10C)[2];
+            }
+            else {
+                (pThis->m68_cameraRotation)[1] = pThis->mF8[1];
+                temp4 = (pThis->m10C)[2];
+                temp3 = (pThis->m10C)[1];
+            }
+
+            fixedPoint temp5 = MTH_Mul(delta[0], -(pThis->m100_deltaPosition)[2]);
+            fixedPoint temp6 = MTH_Mul(delta[2], (pThis->m100_deltaPosition)[0]);
+            if (temp5 + temp6 < 0) {
+                fixedPoint sum = temp3 + temp4;
+                int angle = (sum.asS32() >> 0x10) & 0xFFF;
+                fixedPoint temp7 = FP_Div(getSin(angle), getCos(angle));
+                temp7 = MTH_Mul(temp5 + temp6, temp7);
+                fixedPoint iVar2 = MTH_Mul(delta[0], (pThis->m100_deltaPosition)[0]);
+                fixedPoint iVar3 = MTH_Mul(delta[2], (pThis->m100_deltaPosition)[2]);
+                pThis->m10C.m0_X += ((iVar2 + iVar3) - temp7);
+
+                temp7 = FP_Pow2((pThis->m100_deltaPosition).m0_X);
+                iVar2 = FP_Pow2((pThis->m100_deltaPosition).m8_Z);
+                if (temp7 + iVar2 < (pThis->m10C).m0_X) {
+                    (pThis->m10C).m0_X = temp7 + iVar2;
+                }
+                if ((pThis->m10C).m0_X < 0) {
+                    (pThis->m10C).m0_X = 0;
+                }
+            }
+            isClamped = true;
+        }
+    }
+
+    fixedPoint temp7 = FP_Pow2((pThis->m100_deltaPosition).m0_X);
+    fixedPoint iVar2 = FP_Pow2((pThis->m100_deltaPosition).m8_Z);
+    temp7 = FP_Div((pThis->m10C)[0], temp7 + iVar2);
+
+    pThis->m5C_rawCameraPosition = MTH_Mul(pThis->m100_deltaPosition, temp7) + pThis->mE4_fixedPosition;
+    pThis->m38_interpolatedCameraPosition = pThis->m5C_rawCameraPosition;
+
+    if (isClamped) {
+        sMatrix4x3 auStack_5c;
+        initMatrixToIdentity(&auStack_5c);
+        rotateMatrixShiftedY((pThis->m68_cameraRotation)[1], &auStack_5c);
+        rotateMatrixShiftedX((pThis->m68_cameraRotation)[0], &auStack_5c);
+        scaleMatrixRow2(pThis->m24_distance, &auStack_5c);
+        (pThis->m44_cameraTarget)[0] = (pThis->m38_interpolatedCameraPosition)[0] - auStack_5c.m[0][2];
+        (pThis->m44_cameraTarget)[1] = (pThis->m38_interpolatedCameraPosition)[1] - auStack_5c.m[1][2];
+        (pThis->m44_cameraTarget)[2] = (pThis->m38_interpolatedCameraPosition)[2] - auStack_5c.m[2][2];
+    }
+}
+
+void cameraUpdate_fixed_updateCameraTargetFromRotation(sMainLogic* pThis) {
+    {
+        fixedPoint temp1 = (pThis->m68_cameraRotation[0] - pThis->mF0[0]) & 0xfffffff;
+        fixedPoint temp2 = (pThis->mF8[0] - pThis->mF0[0]) & 0xfffffff;
+        if (temp2 < temp1) {
+            if ((temp2 / 2) + 0x8000000U < temp1) {
+                pThis->m68_cameraRotation[0] = pThis->mF0[0];
+            } else {
+                pThis->m68_cameraRotation[0] = pThis->mF8[0];
+            }
+        }
+    }
+
+    {
+        fixedPoint temp1 = (pThis->m68_cameraRotation[1] - pThis->mF0[1]) & 0xfffffff;
+        fixedPoint temp2 = (pThis->mF8[1] - pThis->mF0[1]) & 0xfffffff;
+        if (temp2 < temp1) {
+            if ((temp2 / 2) + 0x8000000U < temp1) {
+                pThis->m68_cameraRotation[1] = pThis->mF0[1];
+            } else {
+                pThis->m68_cameraRotation[1] = pThis->mF8[1];
+            }
+        }
+    }
+
+    sMatrix4x3 mat;
+    initMatrixToIdentity(&mat);
+    rotateMatrixShiftedY(pThis->m68_cameraRotation[1], &mat);
+    rotateMatrixShiftedX(pThis->m68_cameraRotation[0], &mat);
+    scaleMatrixRow2(pThis->m24_distance, &mat);
+    pThis->m44_cameraTarget[0] = pThis->m38_interpolatedCameraPosition[0] - mat.m[0][2];
+    pThis->m44_cameraTarget[1] = pThis->m38_interpolatedCameraPosition[1] - mat.m[1][2];
+    pThis->m44_cameraTarget[2] = pThis->m38_interpolatedCameraPosition[2] - mat.m[2][2];
+}
+
+void cameraUpdate_mode1(sMainLogic* pThis) {
+    if (pThis->mDC == 0) {
+        pThis->m5C_rawCameraPosition = pThis->mE4_fixedPosition;
+    }
+    else {
+        fixedPoint t = FP_Div(pThis->mDC, pThis->mD8);
+        pThis->m5C_rawCameraPosition[0] = MTH_Mul(pThis->m100_deltaPosition[0] - pThis->mE4_fixedPosition[0], t) + pThis->mE4_fixedPosition[0];
+        pThis->m5C_rawCameraPosition[1] = MTH_Mul(pThis->m100_deltaPosition[1] - pThis->mE4_fixedPosition[1], t) + pThis->mE4_fixedPosition[1];
+        pThis->m5C_rawCameraPosition[2] = MTH_Mul(pThis->m100_deltaPosition[2] - pThis->mE4_fixedPosition[2], t) + pThis->mE4_fixedPosition[2];
+        pThis->mDC--;
+    }
+
+    pThis->m38_interpolatedCameraPosition = pThis->m5C_rawCameraPosition;
+
+    cameraUpdate_fixedSub(pThis);
+
+    sVec3_FP direction;
+    direction[0] = pThis->m44_cameraTarget[0] - pThis->m5C_rawCameraPosition[0];
+    direction[1] = pThis->m44_cameraTarget[1] - pThis->m5C_rawCameraPosition[1];
+    direction[2] = pThis->m44_cameraTarget[2] - pThis->m5C_rawCameraPosition[2];
+    pThis->m24_distance = sqrt_F(MTH_Product3d_FP(direction, direction));
+    computeLookAt(direction, pThis->m68_cameraRotation);
+    pThis->m68_cameraRotation[2] = 0;
+
+    cameraUpdate_fixed_updateCameraTargetFromRotation(pThis);
+}
+
+void cameraUpdate_mode1_LCS(sMainLogic* pThis) {
+    moveTownLCSCursor(pThis);
+    pThis->m68_cameraRotation[0] = (pThis->m68_cameraRotation[0] + MTH_Mul(0xE38E3, pThis->mC_inputY)) & 0xfffffff;
+    pThis->m68_cameraRotation[1] = (pThis->m68_cameraRotation[1] + MTH_Mul(0xE38E3, pThis->m8_inputX)) & 0xfffffff;
+    cameraUpdate_fixed_updateCameraTargetFromRotation(pThis);
+}
+
+void cameraUpdate_fixed_LCS(sMainLogic* pThis) {
+    moveTownLCSCursor(pThis);
+    pThis->m68_cameraRotation[0] = (pThis->m68_cameraRotation[0] + MTH_Mul(0xE38E3, pThis->mC_inputY)) & 0xfffffff;
+    pThis->m68_cameraRotation[1] = (pThis->m68_cameraRotation[1] + MTH_Mul(0xE38E3, pThis->m8_inputX)) & 0xfffffff;
+    cameraUpdate_fixed_updateCameraTargetFromRotation(pThis);
+}
+
+int setupCameraUpdateForCurrentMode()
+{
+    if (twnMainLogicTask->m14_EdgeTask == nullptr)
+        return 0;
+
+    s32 r5_inLcsMode = npcData0.mFC & 0x10;
+
+    switch (twnMainLogicTask->m2_cameraFollowMode)
+    {
+    case 0: // Follow
+        if (r5_inLcsMode)
+        {
+            twnMainLogicTask->m10 = &cameraUpdate_follow_LCS;
+        }
+        else
+        {
+            twnMainLogicTask->m10 = &cameraUpdate_follow;
+        }
+        break;
+    case 1: // Mode 1 (fixed position with target tracking)
+        if (r5_inLcsMode)
+        {
+            twnMainLogicTask->m10 = &cameraUpdate_mode1_LCS;
+        }
+        else
+        {
+            twnMainLogicTask->m10 = &cameraUpdate_mode1;
+        }
+        break;
+    case 3: // Fixed camera (camp)
+        if (r5_inLcsMode)
+        {
+            twnMainLogicTask->m10 = &cameraUpdate_fixed_LCS;
+        }
+        else
+        {
+            twnMainLogicTask->m10 = &cameraUpdate_fixed;
+        }
+        break;
+    default:
+        assert(0);
+        break;
+    }
+
+    return twnMainLogicTask->m2_cameraFollowMode;
+}
+
+int setupCameraFollowMode()
+{
+    twnMainLogicTask->m_DrawMethod = sMainLogic::Draw;
+    scriptFunction_6057058_sub0Sub0();
+    twnMainLogicTask->m2_cameraFollowMode = sMainLogic::TrackingMode_Follow;
+    setupCameraUpdateForCurrentMode();
+
+    return 0; // dummy
+}
+
+// 0605ab0c (RUIN), 0605ba50 (EXCA), 0605a0d4 (E006), 060741a8 (CARA), 0607421c (SEEK), 0609c4cc (ZOAH)
+void setupNPCWalkInZDirection(s32 r4_npcIndex, s32 r5_zDirection, s32 r6_distance)
+{
+    sNPC* r13 = getNpcDataByIndex(r4_npcIndex);
+    sNPCE8* r14 = &r13->mE8;
+    r14->m30_stepTranslation[0] = 0;
+    r14->m30_stepTranslation[1] = 0;
+    r14->m30_stepTranslation[2] = -r5_zDirection;
+
+    sMatrix4x3 var10;
+    initMatrixToIdentity(&var10);
+    rotateMatrixShiftedY(r14->mC_rotation[1], &var10);
+    rotateMatrixShiftedX(r14->mC_rotation[0], &var10);
+    sVec3_FP var4;
+    transformVec(r14->m30_stepTranslation, var4, var10);
+
+    r14->m3C_targetPosition[0] = r14->m0_position[0] + var4[0] * r6_distance;
+    r14->m3C_targetPosition[1] = r14->m0_position[1] + var4[1] * r6_distance;
+    r14->m3C_targetPosition[2] = r14->m0_position[2] + var4[2] * r6_distance;
+
+    r14->m48_targetRotation = r14->mC_rotation;
+
+    r13->mF &= ~0x6;
+    r13->mF |= 1;
+    r13->mC |= 4;
+}
+
+// 06057058 (RUIN), 06057f9c (EXCA), 06056620 (E006), 060706f4 (CARA), 06070768 (SEEK), 06098a18 (ZOAH)
+s32 setupCameraFollowAndWalk()
+{
+    setupCameraFollowMode();
+    setupNPCWalkInZDirection(0, 227, 36);
+    return 0;
+}
+
+// 06056918 (E006), 060709ec (CARA)
+s32 disableMainLogic()
+{
+    twnMainLogicTask->m_UpdateMethod = nullptr;
+    twnMainLogicTask->m_DrawMethod = nullptr;
+    return 0;
+}
+
+// 06056926 (E006), 060709fa (CARA)
+s32 enableMainLogic()
+{
+    twnMainLogicTask->m_UpdateMethod = &sMainLogic::Update;
+    twnMainLogicTask->m_DrawMethod = &sMainLogic::Draw;
+    return 0;
+}
+
+// 06057570 (RUIN), 060584b4 (EXCA), 0606cb54 (CAMP), 06070c0c (CARA), 06070c80 (SEEK), 06098f30 (ZOAH)
+s32 hasLoadingCompleted()
+{
+    if (twnMainLogicTask->m14_EdgeTask)
+    {
+        updateWorldGrid(twnMainLogicTask->m14_EdgeTask->mE8.m0_position[0], twnMainLogicTask->m14_EdgeTask->mE8.m0_position[2]);
+    }
+    return fileInfoStruct.m2C_allocatedHead == nullptr;
+}
+
+void sMainLogic::Init(sMainLogic* pThis)
+{
+    twnMainLogicTask = pThis;
+
+    if (mainGameState.getBit(0x274 * 8 + 7))
+    {
+        pThis->m1_cameraParamsIndex = 1;
+    }
+    else
+    {
+        pThis->m1_cameraParamsIndex = 0;
+    }
+    pThis->m0 = 1;
+    pThis->m10 = &mainLogicDummy;
+
+    resetMatrixStack();
+
+    pThis->m74_townCamera.m30_pPosition = &pThis->m5C_rawCameraPosition;
+    pThis->m74_townCamera.m34_pRotation = &pThis->m68_cameraRotation;
+    pThis->m74_townCamera.m38_pOwner = pThis;
+    pThis->m74_townCamera.m3C_scriptEA = sSaturnPtr::getNull();
+    pThis->m74_townCamera.m40 = 0;
+
+    setCollisionSetup(&pThis->m74_townCamera, 0);
+    setCollisionBounds(&pThis->m74_townCamera, readSaturnVec3(gTWN_RUIN->getSaturnPtr(0x605EEE4)), readSaturnVec3(gTWN_RUIN->getSaturnPtr(0x605EEF0)));
+
+    npcData0.mFC &= ~0x10;
+
+    initTownProjection();
+}
+
+void sMainLogic::Update(sMainLogic* pThis)
+{
+    if (pThis->m14_EdgeTask)
+    {
+        sEdgeTask* r13 = pThis->m14_EdgeTask;
+        updateWorldGrid(r13->mE8.m0_position[0], r13->mE8.m0_position[2]);
+        pThis->m18_position = r13->mE8.m0_position;
+        pThis->m18_position[1] += 0x1800;
+    }
+
+    readPlayerInput(pThis);
+
+    processInputFlags(pThis);
+
+    if (!(npcData0.mFC & 1))
+    {
+        setupCameraUpdateForCurrentMode();
+    }
+
+    pThis->m10(pThis);
+
+    pThis->m50_upVector = pThis->m38_interpolatedCameraPosition;
+    pThis->m50_upVector[1] += 0x10000;
+    pThis->m4_flags = 0;
+
+    updateAutoWalk(pThis);
+}
+
+void sMainLogic::Draw(sMainLogic* pThis)
+{
+    sVec3_FP var18 = pThis->m38_interpolatedCameraPosition + ((pThis->m44_cameraTarget - pThis->m38_interpolatedCameraPosition) * 16);
+
+    generateCameraMatrix(&cameraProperties2, pThis->m38_interpolatedCameraPosition, var18, pThis->m50_upVector);
+
+    drawLcs();
+
+    if (enableDebugTask)
+    {
+        assert(0);
+    }
+}
+
+p_workArea startMainLogic(p_workArea pParent)
+{
+    return createSubTask<sMainLogic>(pParent);
+}

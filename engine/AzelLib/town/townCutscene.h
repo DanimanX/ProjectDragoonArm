@@ -1,0 +1,148 @@
+#pragma once
+
+struct sStreamingFile_C8
+{
+    u32 m0_compressionType;
+    p_workArea m4_pOwner;
+    s_3dModel* m8_p3dModel;
+};
+
+struct sStreamingFile_28
+{
+    s32 m0;
+    s32 m4;
+    s32 m8;
+    s32 mC;
+    s32 m10;
+    u32 m14;
+    u32 m18;
+    s32 m1C;
+    s32 m20_vdp2StringIndex;
+    u32 m24_currentPositionInFile;
+    u32 m28;
+    u8* m2C_pBufferWrite;
+    u8* m30;
+    u8* m34_pBufferRead;
+    u8* m38;
+    u8* m3C;
+    u8* m40;
+    u32 m44_headerSize;
+    u32 m4C;
+    u32 m48;
+    u32 m50;
+    u32 m54;
+    u8* m58;
+    u8* m5C_audioBuffer;
+    u32 m60;
+    u32 m64_sampleIndex;
+    u32 m68_writePosition;
+    u32 m6C;
+    u32 m70;
+    u32 m78;
+    u32 m7C;
+    u32 m80_cpuTimer;
+    u32 m84_frameIndex;
+    u32 m88;
+    u32 m90;
+    u32 m94;
+    std::array<s32, 2> m98;
+};
+
+struct GfsHn
+{
+    FILE* fHandle;
+};
+
+struct sStreamingFile_198
+{
+    GfsHn m0_gfsHandle;
+    u32 m4_transfertSectorSize;
+    u32 m8_readIsPending;
+    u32 mC_pendingReadSize;
+    u32 m10_numBytesReadForCurrentRequest;
+    u32 m14_numSectors;
+    u32 m18_fileSize;
+    //size 0x20?
+};
+
+// FUN_0600e4ce writes this metadata after the sStreamingFile for PCM-only streams.
+// In cutscene streams, the same layout exists at the start of the disc data buffer.
+struct sPCMStreamMetadata
+{
+    u32 m0_headerSize;
+    u8 m4_channels;
+    u8 m5_bitDepth;
+    u8 m6_pad;
+    u8 m7_pad;
+    u32 m8_sampleRateFP;
+    u32 mC_frameRate;
+    u32 m10_totalFrames;
+    u32 m14_pad;
+}; // size 0x18
+
+struct sStreamingFile
+{
+    u8* m0_buffer;
+    u32 m4_bufferSize;
+    s32 m8;
+    s32 m10;
+    s32 m14;
+    u8* m18_audioBuffer;
+    u32 m1C_audioBufferSize;
+    s32 m20;
+    s32 m24;
+    sStreamingFile_28 m28;
+    std::array<sStreamingFile_C8, 0x10> mC8_cutsceneEntities;
+    u32 m188_camera; // probably in m28
+    u32 m18C;
+    u32 m190_emptyBytes;
+    sPCMStreamMetadata* m194;
+    sStreamingFile_198 m198;
+    //size 0x1B8?
+
+    // C++ only: SoLoud playback state (replaces Saturn SCSP streaming)
+    SoLoud::Wav* m_pWav = nullptr;
+    SoLoud::handle m_soloudHandle = 0;
+    u64 m_startTime = 0;
+    double m_durationSeconds = 0.0;
+};
+
+struct sCutsceneTask : public s_workAreaTemplateWithArg<sCutsceneTask, s32>
+{
+    static TypedTaskDefinition* getTypedTaskDefinition()
+    {
+        static TypedTaskDefinition taskDefinition = { &sCutsceneTask::Init, nullptr, &sCutsceneTask::Draw, &sCutsceneTask::Delete };
+        return &taskDefinition;
+    }
+
+    static void Init(sCutsceneTask* pThis, s32 arg);
+    static void cutsceneDrawSub0(sCutsceneTask* pThis, s32 r5);
+    static void Draw(sCutsceneTask* pThis);
+    static void Delete(sCutsceneTask* pThis);
+
+    sStreamingFile* m0;
+    sStreamingFile m4;
+    u8* m1D4;
+    // size: 0x1d8
+};
+
+extern sCutsceneTask* gCutsceneTask;
+extern s32 gCutsceneFlags;
+
+sStreamingFile* openPCMFileForStreaming(sStreamingFile* pStreamingFile, u8* pBuffer, s32 bufferSize, sPCMStreamMetadata* pMetadata, const std::string& filename, s32 sampleRate);
+void drawPCMDebugDisplay(sStreamingFile* param_1);
+void stopPCMStreaming(sStreamingFile* pStreamingFile);
+
+void scriptFunction_60573d8Sub0(sStreamingFile* r4);
+s32 scriptFunction_605861eSub0Sub0(sStreamingFile* r4);
+s32 getCutsceneFrameIndex(sStreamingFile*);
+s32 getPositionInEDK(sStreamingFile* iParm1);
+void setupCutsceneModelType2(sStreamingFile* r4, u32 r5, p_workArea r6, s_3dModel* pModel);
+void setupCutsceneDragon(sStreamingFile* r4, u32 r5, p_workArea r6, s_3dModel* pModel);
+
+s32 townCreateCutscene(s32 arg);
+s32 createEPKPlayer(s32 arg);
+s32 townIsCutsceneDone();
+s32 townDeleteCutscene();
+s32 townStartCutscenePlayback();
+s32 townGetCutsceneHalfPosition();

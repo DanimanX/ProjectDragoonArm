@@ -1,0 +1,640 @@
+#include "PDS.h"
+#include "kernel/vdp1Allocator.h"
+#include "kernel/fileBundle.h"
+#include "field/field_a3/o_fld_a3.h" //TODO: cleanup
+#include "field/fieldVisibilityGrid.h"
+#include "processModel.h"
+
+s_fieldTaskWorkArea* fieldTaskPtr = NULL;
+sFieldOverlay* gCurrentFieldOverlay = nullptr;
+
+u8 fieldMainBuffer[0x68000];
+
+void initFieldMemoryArea(u8* buffer, u32 bufferSize)
+{
+    fieldTaskPtr->m8_pSubFieldData->m20_memoryArea_bottom = buffer;
+    fieldTaskPtr->m8_pSubFieldData->m18_memoryArea_edge = buffer;
+    fieldTaskPtr->m8_pSubFieldData->m24_memoryArea_top = buffer + bufferSize;
+}
+
+void initFieldVdp1Area(u32 buffer, u32 bufferSize)
+{
+    fieldTaskPtr->m8_pSubFieldData->m28_characterArea_bottom = buffer;
+    fieldTaskPtr->m8_pSubFieldData->m1C_characterArea_edge = buffer;
+    fieldTaskPtr->m8_pSubFieldData->m2C_characterArea_top = buffer + bufferSize;
+}
+
+void loadCommonFieldResources()
+{
+    initDramAllocator(fieldTaskPtr, playerDataMemoryBuffer, sizeof(playerDataMemoryBuffer), NULL);
+
+    initVdp1Ram(fieldTaskPtr->m4_overlayTaskData, 0x25C18800, 0x4000);
+
+    initFieldMemoryArea(fieldMainBuffer, sizeof(fieldMainBuffer));
+    initFieldVdp1Area(0x25C1C800, 0x5F800);
+}
+
+int findMandatoryFileOnDisc(const char* fileName)
+{
+    FILE* fHandle = fopen(fileName, "rb");
+
+    if (fHandle == NULL)
+        return 0;
+
+    fclose(fHandle);
+    return 1;
+}
+
+u32 getFileSizeFromFileId(const char* fileName)
+{
+    FILE* fHandle = fopen(fileName, "rb");
+
+    if (fHandle == NULL)
+        return 0;
+
+    fseek(fHandle, 0, SEEK_END);
+    u32 fileSize = ftell(fHandle);
+
+    fclose(fHandle);
+    return fileSize;
+}
+
+void checkFilesExists(const s_MCB_CGB* fileList)
+{
+    u32* MCBSizes = fieldTaskPtr->m8_pSubFieldData->m34_MCBFilesSizes;
+    u32* CGBSizes = fieldTaskPtr->m8_pSubFieldData->m1B4_CGBFilesSizes;
+
+    while (fileList->MCB != (const char*)-1)
+    {
+        if (fileList->MCB == nullptr) {
+            *(MCBSizes++) = 0;
+        }
+        else {
+            assert(findMandatoryFileOnDisc(fileList->MCB) >= 0);
+            *(MCBSizes++) = getFileSizeFromFileId(fileList->MCB);
+        }
+
+        if (fileList->CGB == nullptr) {
+            *(CGBSizes++) = 0;
+        }
+        else {
+            assert(findMandatoryFileOnDisc(fileList->CGB) >= 0);
+            *(CGBSizes++) = getFileSizeFromFileId(fileList->CGB);
+        }
+
+        fileList++;
+    }
+    *MCBSizes = 0xFFFFFFFF;
+}
+
+void setupFileList(const s_MCB_CGB* fileList)
+{
+    fieldTaskPtr->m8_pSubFieldData->m30_fileList = fileList;
+
+    checkFilesExists(fileList);
+
+    u8* buffers[3];
+    buffers[0] = fieldTaskPtr->m8_pSubFieldData->m20_memoryArea_bottom;
+    buffers[1] = buffers[0] + fieldTaskPtr->m8_pSubFieldData->m34_MCBFilesSizes[0]; // TODO: should be aligned
+    buffers[2] = buffers[1] + fieldTaskPtr->m8_pSubFieldData->m34_MCBFilesSizes[1]; // TODO: should be aligned
+
+    fieldTaskPtr->m8_pSubFieldData->m0_bundles[0] = new s_fileBundle(buffers[0]);
+    fieldTaskPtr->m8_pSubFieldData->m0_bundles[1] = new s_fileBundle(buffers[1]);
+    fieldTaskPtr->m8_pSubFieldData->m0_bundles[2] = new s_fileBundle(buffers[2]);
+
+    fieldTaskPtr->m8_pSubFieldData->mC_characterArea[0] = fieldTaskPtr->m8_pSubFieldData->m28_characterArea_bottom;
+    fieldTaskPtr->m8_pSubFieldData->mC_characterArea[1] = fieldTaskPtr->m8_pSubFieldData->mC_characterArea[0] + fieldTaskPtr->m8_pSubFieldData->m1B4_CGBFilesSizes[0]; // TODO: should be aligned
+    fieldTaskPtr->m8_pSubFieldData->mC_characterArea[2] = fieldTaskPtr->m8_pSubFieldData->mC_characterArea[1] + fieldTaskPtr->m8_pSubFieldData->m1B4_CGBFilesSizes[1]; // TODO: should be aligned
+
+    u32 currentFileIndex = 2;
+    const s_MCB_CGB* currentFileList = fileList + currentFileIndex;
+
+    u32 largestMCB = 0;
+    u32 largestCGB = 0;
+
+    while (currentFileList->MCB != (const char*)-1)
+    {
+        largestMCB = std::max(fieldTaskPtr->m8_pSubFieldData->m34_MCBFilesSizes[currentFileIndex], largestMCB);
+        largestCGB = std::max(fieldTaskPtr->m8_pSubFieldData->m1B4_CGBFilesSizes[currentFileIndex], largestCGB);
+
+        currentFileList++;
+        currentFileIndex++;
+    }
+
+    fieldTaskPtr->m8_pSubFieldData->m18_memoryArea_edge = buffers[2] + largestMCB; // TODO: should be aligned
+    fieldTaskPtr->m8_pSubFieldData->m1C_characterArea_edge = fieldTaskPtr->m8_pSubFieldData->mC_characterArea[2] + largestCGB; // TODO: should be aligned
+}
+
+s32 getFieldMemoryAreaRemain()
+{
+    return fieldTaskPtr->m8_pSubFieldData->m24_memoryArea_top - fieldTaskPtr->m8_pSubFieldData->m18_memoryArea_edge;
+}
+
+s32 getFieldCharacterAreaRemain()
+{
+    return fieldTaskPtr->m8_pSubFieldData->m2C_characterArea_top - fieldTaskPtr->m8_pSubFieldData->m1C_characterArea_edge;
+}
+
+// 0601233c
+void unloadFileFromFileList(u32 index)
+{
+    // On Saturn, this closes the GFS file handles for the MCB/CGB at the given index.
+    // On PC, files are loaded synchronously and handles are freed immediately in loadFile(),
+    // so there is nothing to close here.
+}
+
+void loadFileFromFileList(u32 index)
+{
+    const s_MCB_CGB* pFileData = &fieldTaskPtr->m8_pSubFieldData->m30_fileList[index];
+
+    int slot = std::min(2, (int)index);
+
+    if (pFileData->MCB)
+    {
+        loadFile(pFileData->MCB, &fieldTaskPtr->m8_pSubFieldData->m0_bundles[slot], fieldTaskPtr->m8_pSubFieldData->mC_characterArea[slot] >> 3);
+    }
+
+    if (pFileData->CGB)
+    {
+        loadFile(pFileData->CGB, getVdp1Pointer(fieldTaskPtr->m8_pSubFieldData->mC_characterArea[slot]), 0);
+    }
+}
+
+void getMemoryArea(s_memoryAreaOutput* pOutput, u32 areaIndex)
+{
+    if (areaIndex > 2)
+    {
+        areaIndex = 2;
+    }
+
+    pOutput->m0_mainMemoryBundle = fieldTaskPtr->m8_pSubFieldData->m0_bundles[areaIndex];
+    pOutput->m4_characterArea = fieldTaskPtr->m8_pSubFieldData->mC_characterArea[areaIndex];
+}
+
+//kernel
+void exitCutsceneTaskUpdateSub0Sub1Sub0Sub0(s32 fieldIndex)
+{
+    if (fieldTaskPtr->m2C_currentFieldIndex == fieldIndex)
+        return;
+
+    switch (fieldIndex)
+    {
+    case 3:
+        mainGameState.setPackedBits(135, 6, 86);
+        break;
+    case 6:
+        mainGameState.setPackedBits(135, 6, 99);
+        break;
+    case 17:
+        mainGameState.setPackedBits(135, 6, 109);
+        break;
+    default:
+        break;
+    }
+}
+
+//kernel
+void exitCutsceneTaskUpdateSub0Sub1Sub0Sub1(s32 fieldIndex, s32 r5, s32 r6)
+{
+    if (fieldTaskPtr->m2C_currentFieldIndex != fieldIndex)
+    {
+        fieldTaskPtr->m2E_currentSubFieldIndex = -1;
+        if (fieldTaskPtr->m0)
+        {
+            fieldTaskPtr->m0->getTask()->markFinished();
+        }
+    }
+    else
+    {
+        if (fieldTaskPtr->m8_pSubFieldData)
+        {
+            fieldTaskPtr->m8_pSubFieldData->getTask()->markFinished();
+        }
+    }
+
+    fieldTaskPtr->m36_fieldIndexMenuSelection = fieldIndex;
+    fieldTaskPtr->m38_subFieldIndexMenuSelection = r5;
+    fieldTaskPtr->m3A = r6;
+    fieldTaskPtr->m3C_fieldTaskState = 5;
+}
+
+// kernel
+struct exitCutsceneTaskUpdateSub0Sub1Sub0 : public s_workAreaTemplate<exitCutsceneTaskUpdateSub0Sub1Sub0>
+{
+    static void update(exitCutsceneTaskUpdateSub0Sub1Sub0* pThis)
+    {
+        switch (pThis->m14_status)
+        {
+        case 0:
+            fieldTaskPtr->m28_status |= 0x100;
+            if (g_fadeControls.m_4D >= g_fadeControls.m_4C)
+            {
+                vdp2Controls.m20_registers[0].m112_CLOFSL = 0x10;
+                vdp2Controls.m20_registers[1].m112_CLOFSL = 0x10;
+            }
+
+            fadePalette(&g_fadeControls.m0_fade0, convertColorToU32ForFade(g_fadeControls.m0_fade0.m0_color), pThis->m0, pThis->m10);
+            fadePalette(&g_fadeControls.m24_fade1, convertColorToU32ForFade(g_fadeControls.m24_fade1.m0_color), pThis->m0, pThis->m10);
+            pThis->m14_status++;
+            //fall through
+        case 1:
+            if (!g_fadeControls.m0_fade0.m20_stopped)
+                return;
+            exitCutsceneTaskUpdateSub0Sub1Sub0Sub0(pThis->m4_fieldIndex);
+            exitCutsceneTaskUpdateSub0Sub1Sub0Sub1(pThis->m4_fieldIndex, pThis->m8, pThis->mC_exitNumber);
+            pThis->m14_status++;
+            break;
+        case 2:
+            if (fieldTaskPtr->m8_pSubFieldData)
+            {
+                pThis->m14_status++;
+            }
+            break;
+        case 3:
+            fieldTaskPtr->m28_status &= ~0x100;
+            if (pThis)
+            {
+                pThis->getTask()->markFinished();
+            }
+            break;
+        default:
+            assert(0);
+            break;
+        }
+    }
+
+    s32 m0;
+    s32 m4_fieldIndex;
+    s32 m8;
+    s32 mC_exitNumber;
+    s32 m10;
+    s32 m14_status;
+    //size 18
+};
+
+// kernel
+void exitCutsceneTaskUpdateSub0Sub1(s32 fieldIndex, s32 param, s32 exitNumber, s32 r7)
+{
+    if (param < 0)
+    {
+        dispatchTutorialMultiChoiceSub2();
+    }
+    else
+    {
+        exitCutsceneTaskUpdateSub0Sub1Sub0* pNewTask = createSubTaskFromFunction<exitCutsceneTaskUpdateSub0Sub1Sub0>(fieldTaskPtr, &exitCutsceneTaskUpdateSub0Sub1Sub0::update);
+        pNewTask->m0 = r7;
+        pNewTask->m4_fieldIndex = fieldIndex;
+        pNewTask->m8 = param;
+        pNewTask->mC_exitNumber = exitNumber;
+        pNewTask->m10 = 20;
+    }
+}
+
+void exitCutsceneTaskUpdateSub0(s32 param, s32 exitNumber, s16 r6)
+{
+    setFieldExiting();
+    exitCutsceneTaskUpdateSub0Sub1(getFieldTaskPtr()->m2C_currentFieldIndex, param, exitNumber, r6);
+}
+
+void initFieldDragonLight()
+{
+    s_dragonTaskWorkArea* pDragonTask = getFieldTaskPtr()->m8_pSubFieldData->m338_pDragonTask;
+    pDragonTask->mC8_normalLightColor.m0 = 0x10;
+    pDragonTask->mC8_normalLightColor.m1 = 0x10;
+    pDragonTask->mC8_normalLightColor.m2 = 0x10;
+
+    pDragonTask->mCB_falloffColor0.m0 = 9;
+    pDragonTask->mCB_falloffColor0.m1 = 9;
+    pDragonTask->mCB_falloffColor0.m2 = 9;
+
+    pDragonTask->mCE_falloffColor1.m0 = -5;
+    pDragonTask->mCE_falloffColor1.m1 = -5;
+    pDragonTask->mCE_falloffColor1.m2 = -5;
+
+    pDragonTask->mD1_falloffColor2.m0 = 0x19;
+    pDragonTask->mD1_falloffColor2.m1 = 0x19;
+    pDragonTask->mD1_falloffColor2.m2 = 0x19;
+
+    pDragonTask->mC0_lightRotationAroundDragon = 0xC000000;
+}
+
+// 0606f5cc
+void gridCellDraw_normalSub2(s_fileBundle* r4, s32 r5, s32 r6)
+{
+    if (r5 == 0)
+        return;
+
+    sProcessed3dModel* pModel = r4->get3DModel(r5);
+    if (pModel == nullptr)
+        return;
+
+    fixedPoint radius = pModel->m0_radius + 0x8000;
+    s_visibilityGridWorkArea* pVisGrid = getFieldTaskPtr()->m8_pSubFieldData->m348_pFieldCameraTask1;
+    s_dragonTaskWorkArea* pDragon = getFieldTaskPtr()->m8_pSubFieldData->m338_pDragonTask;
+
+    sMatrix4x3 savedMatrix;
+    copyMatrix(pCurrentMatrix, &savedMatrix);
+
+    pushCurrentMatrix();
+    copyToCurrentMatrix(&cameraProperties2.m28[0]);
+    multiplyCurrentMatrix(&savedMatrix);
+
+    // Check if the model is within bounding radius of the dragon position
+    fixedPoint dx = pCurrentMatrix->m[0][3] - pDragon->m8_pos[0];
+    if ((s32)dx < 0) dx = -dx;
+    fixedPoint dy = pCurrentMatrix->m[1][3] - pDragon->m8_pos[1];
+    if ((s32)dy < 0) dy = -dy;
+    fixedPoint dz = pCurrentMatrix->m[2][3] - pDragon->m8_pos[2];
+    if ((s32)dz < 0) dz = -dz;
+
+    if ((s32)dx <= (s32)radius && (s32)dy <= (s32)radius && (s32)dz <= (s32)radius)
+    {
+        // Copy transform matrix to the collision entry slot
+        copyMatrix(pCurrentMatrix, &pVisGrid->m44->m4_matrix);
+
+        // Debug collision rendering
+        if (pVisGrid->m12F2_renderMode == 1)
+        {
+            pushCurrentMatrix();
+            sMatrix4x3* debugMatrix = getFieldCameraMatrix();
+            copyToCurrentMatrix(debugMatrix);
+            multiplyCurrentMatrix(&pVisGrid->m44->m4_matrix);
+            addObjectToDrawList(pModel);
+            popMatrix();
+        }
+
+        allocateLCSEntry(pVisGrid, pModel, r6);
+    }
+
+    popMatrix();
+}
+
+void callGridCellDraw_normalSub2(s_fileBundle* r4, s32 r5)
+{
+    gridCellDraw_normalSub2(r4, r5, 0x10000);
+}
+
+// --- Shared field script/cutscene queries ---
+
+bool isNoCutsceneActive()
+{
+    return getFieldTaskPtr()->m8_pSubFieldData->m34C_ptrToE->m48_cutsceneTask == nullptr;
+}
+
+s32 isScriptActive()
+{
+    s_fieldScriptWorkArea* p = getFieldTaskPtr()->m8_pSubFieldData->m34C_ptrToE;
+    if (p->m4_currentScript.m_offset == 0 && p->m30_cinematicBarTask == nullptr && p->m34 == 0
+        && p->m38_dialogStringTask == nullptr && p->m3C_multichoiceTask == nullptr && p->m40_receivedItemTask == nullptr)
+        return 0;
+    return 1;
+}
+
+// 0606b18c (A3)
+void setFieldExiting()
+{
+    getFieldTaskPtr()->m8_pSubFieldData->m34C_ptrToE->m64_isExitingField = 1;
+}
+
+// --- Shared dragon getters ---
+
+void getDragonPosition(sVec3_FP* pOut)
+{
+    s_dragonTaskWorkArea* p = getFieldTaskPtr()->m8_pSubFieldData->m338_pDragonTask;
+    pOut->m0_X = p->m8_pos.m0_X;
+    pOut->m4_Y = p->m8_pos.m4_Y;
+    pOut->m8_Z = p->m8_pos.m8_Z;
+}
+
+void getDragonAngle(sVec3_FP* pOut)
+{
+    s_dragonTaskWorkArea* p = getFieldTaskPtr()->m8_pSubFieldData->m338_pDragonTask;
+    pOut->m0_X = p->m20_angle.m0_X;
+    pOut->m4_Y = p->m20_angle.m4_Y;
+    pOut->m8_Z = p->m20_angle.m8_Z;
+}
+
+// 0607ce7c - set dragon speed to the given index (0..4) from the speed table.
+// Shared across overlays (A5, C8, etc.).
+void setDragonSpeedIndex(s32 speedIndex)
+{
+    if (speedIndex < 0 || speedIndex >= 5)
+        return;
+
+    s_dragonTaskWorkArea* pDragon = getFieldTaskPtr()->m8_pSubFieldData->m338_pDragonTask;
+    pDragon->m235_dragonSpeedIndex = (s8)speedIndex;
+    pDragon->m154_dragonSpeed = pDragon->m21C_DragonSpeedValues[pDragon->m235_dragonSpeedIndex];
+
+    s32 midSpeed = (s32)((u32)(pDragon->m21C_DragonSpeedValues[0].m_value
+                              + pDragon->m21C_DragonSpeedValues[1].m_value
+                              + (u32)(pDragon->m21C_DragonSpeedValues[0].m_value
+                                    + pDragon->m21C_DragonSpeedValues[1].m_value < 0)) >> 1);
+    if (pDragon->m154_dragonSpeed.m_value > midSpeed)
+    {
+        pDragon->m238 = 4;
+        pDragon->m237 = 4;
+    }
+    else
+    {
+        pDragon->m238 = 0;
+        pDragon->m237 = 0;
+    }
+}
+
+void triggerSubfieldChange(s32 destSubfield, s16 param)
+{
+    setFieldExiting();
+    exitCutsceneTaskUpdateSub0Sub1(getFieldTaskPtr()->m2C_currentFieldIndex, destSubfield, 0, param);
+}
+
+// --- Shared grid/visibility helpers ---
+
+p_workArea findGridParentForEntity(sSaturnPtr pData)
+{
+    // Simplified: use grid work area as fallback parent
+    return (p_workArea)getFieldTaskPtr()->m8_pSubFieldData->m348_pFieldCameraTask1;
+}
+
+bool isPointOnScreen(sVec3_FP* pViewPos, s32 maxDepth)
+{
+    if (pViewPos->m8_Z.asS32() < 0 || pViewPos->m8_Z.asS32() > maxDepth)
+    {
+        return false;
+    }
+    s16 projParamX, projParamY;
+    getVdp1ProjectionParams(&projParamX, &projParamY);
+    s32 screenX = setDividend(projParamX, pViewPos->m0_X.asS32(), pViewPos->m8_Z.asS32());
+    s32 absX = (s16)screenX < 0 ? -(s16)screenX : (s16)screenX;
+    if (absX >= 0xC1)
+    {
+        return false;
+    }
+    s32 screenY = setDividend(projParamY, pViewPos->m4_Y.asS32(), pViewPos->m8_Z.asS32());
+    s32 absY = (s16)screenY < 0 ? -(s16)screenY : (s16)screenY;
+    return absY < 0x81;
+}
+
+// 0606fade (A7) - world position on-screen test taking sVec3_FP*
+bool isWorldPositionOnScreen(sVec3_FP* pWorldPos)
+{
+    sVec3_FP viewPos;
+    transformAndAddVecByCurrentMatrix(pWorldPos, &viewPos);
+    return isPointOnScreen(&viewPos, graphicEngineStatus.m405C.m14_farClipDistance);
+}
+
+// Wrapper taking sSaturnPtr (reads position from Saturn memory)
+bool isWorldPositionOnScreen(sSaturnPtr posEA)
+{
+    sVec3_FP worldPos = readSaturnVec3(posEA);
+    return isWorldPositionOnScreen(&worldPos);
+}
+
+s_RGB8 readSaturnRGB8(const sSaturnPtr& ptr)
+{
+    s_RGB8 newValue;
+    newValue.m0 = readSaturnU8(ptr + 0);
+    newValue.m1 = readSaturnU8(ptr + 1);
+    newValue.m2 = readSaturnU8(ptr + 2);
+
+    return newValue;
+}
+
+// 0606818c (A7) / 06069bc0 (A3) - start field script with game-state flag check
+s32 startFieldScriptWithFlagCheck(s32 scriptIndex, u32 flagBit)
+{
+    s_fieldScriptWorkArea* pScript = getFieldTaskPtr()->m8_pSubFieldData->m34C_ptrToE;
+    if (pScript->m0_pScripts == nullptr)
+        return 0;
+
+    if (pScript->m4_currentScript.m_offset != 0)
+        return 0;
+
+    if ((s32)flagBit >= 0)
+    {
+        u32 adjusted = (flagBit < 1000) ? flagBit : (flagBit - 0x236);
+        if ((mainGameState.bitField[adjusted >> 3] & bitMasks[adjusted & 7]) != 0)
+            pScript->m60_canSkipScript = 1;
+        else
+            pScript->m60_canSkipScript = 0;
+    }
+
+    pScript->m4_currentScript = pScript->m0_pScripts[scriptIndex];
+    pScript->m2C_bitToSet = flagBit;
+    pScript->m58_debugFastForward = 0;
+    pScript->m50_scriptDelay = 0;
+    return 1;
+}
+
+void freeVdp1Block(npcFileDeleter* parent, void* dataToFree);
+void fieldPaletteTaskInitSub0Sub0();
+
+// 0606fe10 (A7) / 06071844 (A3) - signed random in [-range/2, range/2)
+s32 signedRandom(s32 range)
+{
+    s32 r = randomNumber();
+    r = performModulo2(range, r);
+    return r - (range >> 1);
+}
+
+// 06073566 (A7) / 06074f9a (A3) - check if dragon has no active camera script/cutscene
+s32 isDragonCameraScriptInactive()
+{
+    s_dragonTaskWorkArea* pDragon = getFieldTaskPtr()->m8_pSubFieldData->m338_pDragonTask;
+    if (pDragon->m1D0_cameraScript == nullptr && pDragon->m1D4_cutsceneData == nullptr)
+    {
+        return 1;
+    }
+    return 0;
+}
+
+// 0607790a (A7) / 0607933e (A3) - release multichoice memory blocks
+void releaseMultiChoiceBlocks()
+{
+    s_fieldScriptWorkArea* pScript = getFieldTaskPtr()->m8_pSubFieldData->m34C_ptrToE;
+    s_multiChoice* pChoice = pScript->m44_multiChoiceData;
+    if (pChoice != nullptr)
+    {
+        freeVdp1Block((npcFileDeleter*)pScript, pChoice->m0_choiceTable);
+        freeVdp1Block((npcFileDeleter*)pScript, pChoice);
+        pScript->m44_multiChoiceData = nullptr;
+        fieldPaletteTaskInitSub0Sub0();
+    }
+}
+
+// 06060118 (A7) / 06061b4c (A3) - clear camera zone targets
+s32 clearCameraZoneTargets(s32 zoneIndex)
+{
+    sFieldCameraManager* pCameraManager = getFieldTaskPtr()->m8_pSubFieldData->m334;
+    sFieldCameraZone& zone = pCameraManager->m2E4_cameraZones[zoneIndex - 1];
+    zone.m14_triggerRadius = 0;
+    zone.m18_maxDistanceSquare = 0;
+    zone.m1C = 0;
+    return 0x334;
+}
+
+// 060613ca (A7) / 0606a9f2 (A5) / 06062dfe (A3) - add camera impulse
+void addCameraImpulse(sVec3_FP* positionImpulse, sVec3_FP* rotationImpulse)
+{
+    sFieldCameraStatus* pCam = getFieldCameraStatus();
+    if (positionImpulse)
+    {
+        pCam->m50_positionImpulse.m0_X = fixedPoint(pCam->m50_positionImpulse.m0_X.m_value + positionImpulse->m0_X.m_value);
+        pCam->m50_positionImpulse.m4_Y = fixedPoint(pCam->m50_positionImpulse.m4_Y.m_value + positionImpulse->m4_Y.m_value);
+        pCam->m50_positionImpulse.m8_Z = fixedPoint(pCam->m50_positionImpulse.m8_Z.m_value + positionImpulse->m8_Z.m_value);
+    }
+    if (rotationImpulse)
+    {
+        pCam->m68_rotationImpulse.m0_X = fixedPoint(pCam->m68_rotationImpulse.m0_X.m_value + rotationImpulse->m0_X.m_value);
+        pCam->m68_rotationImpulse.m4_Y = fixedPoint(pCam->m68_rotationImpulse.m4_Y.m_value + rotationImpulse->m4_Y.m_value);
+        pCam->m68_rotationImpulse.m8_Z = fixedPoint(pCam->m68_rotationImpulse.m8_Z.m_value + rotationImpulse->m8_Z.m_value);
+    }
+}
+
+void createCellObjects(s_visdibilityCellTask* r4, std::vector<s_DataTable2Sub0>& r5, s32 r6)
+{
+    assert(gCurrentFieldOverlay);
+    for (int i = 0; i < r5.size(); i++)
+    {
+        gCurrentFieldOverlay->dispatchCellObjectCreation(r4, r5[i], r6);
+    }
+}
+
+void setupFieldWithCellObjects(s_DataTable3* r4, s_DataTable2* r5, void(*r6)(p_workArea workArea))
+{
+    s_visibilityGridWorkArea* pFieldCameraTask1 = getFieldTaskPtr()->m8_pSubFieldData->m348_pFieldCameraTask1;
+
+    setupField2(r4, r6);
+
+    if (r5)
+    {
+        s_visdibilityCellTask** r12 = pFieldCameraTask1->m3C_cellRenderingTasks;
+        if (r12)
+        {
+            s32 r11 = r5->m8.m0 * r5->m8.m4;
+            std::vector<std::vector<s_DataTable2Sub0>>::iterator r14 = r5->m0.begin();
+
+            do
+            {
+                if (r14->size())
+                {
+                    createCellObjects(*r12, *r14, r5->m4);
+                }
+
+                r14++;
+                r12++;
+            } while (--r11);
+        }
+    }
+}
+
+void setupField(s_DataTable3* r4, s_DataTable2* r5, void(*r6)(p_workArea workArea), std::vector<std::vector<sCameraVisibility>>* r7)
+{
+    getFieldTaskPtr()->m8_pSubFieldData->m348_pFieldCameraTask1->m34_cameraVisibilityTable = r7;
+
+    setupFieldWithCellObjects(r4, r5, r6);
+}
+
+// 060726d8
+void fieldNoop()
+{
+}

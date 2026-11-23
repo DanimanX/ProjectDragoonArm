@@ -1,0 +1,469 @@
+#include "PDS.h"
+#include "a3_0_task4.h"
+#include "items.h"
+#include "audio/soundDriver.h"
+#include "field/field_a3/o_fld_a3.h" //TODO: cleanup
+#include "field/field_a3/a3_background_layer.h"
+#include "field/fieldParticlePool.h"
+#include "field/fieldRadar.h"
+#include "field/exitField.h"
+#include "field/fieldItemBox.h"
+
+void pushDragonInvisibleWall(s_dragonTaskWorkArea* pDragon, sVec3_FP& dragonPosition)
+{
+    fixedPoint pushAmount;
+
+    if (dragonPosition[0] < 0x3A2001)
+    {
+        pushAmount = -MTH_Mul(0x4A12, randomNumber() & 0xFFFF);
+    }
+    else
+    {
+        pushAmount = -0x4A12;
+    }
+
+    pDragon->m160_deltaTranslation[0] += pushAmount;
+
+    if ((fieldTaskPtr->m8_pSubFieldData->m370_fieldDebuggerWho & 1) && (fieldTaskPtr->m8_pSubFieldData->m37C_debugMenuStatus1[1] == 0) && (fieldTaskPtr->m8_pSubFieldData->m369 == 0))
+    {
+        vdp2DebugPrintSetPosition(3, 0x19);
+        vdp2PrintfSmallFont("%08x ", -pushAmount);
+    }
+}
+
+void subfieldA3_0Sub0(s_dragonTaskWorkArea* r4)
+{
+    sVec3_FP dragonPosition;
+    getFieldDragonPosition(&dragonPosition);
+
+    if (!mainGameState.getBit(0xA2 * 8 + 3) && !mainGameState.getBit(0x91 * 8 + 3))
+    {
+        if ((dragonPosition[0] > 0x321FFF) && (dragonPosition[2] < -0x1229FFF))
+        {
+            pushDragonInvisibleWall(r4, dragonPosition);
+        }
+    }
+}
+
+p_workArea fieldA3_0_createTask0(p_workArea workArea)
+{
+    s_fieldSpecificData_A3* newWorkArea = createSubTaskFromFunction<s_fieldSpecificData_A3>(workArea, NULL);
+    getFieldTaskPtr()->mC = newWorkArea;
+    return newWorkArea;
+}
+
+struct s_fieldA3_0_tutorialTask : public s_workAreaTemplate<s_fieldA3_0_tutorialTask>
+{
+    // size 0x2C
+};
+
+void fieldA3_0_tutorialTask_update(s_fieldA3_0_tutorialTask* workArea)
+{
+    if (startFieldScript(21, -1))
+    {
+        workArea->getTask()->markFinished();
+    }
+}
+
+void create_fieldA3_0_tutorialTask(p_workArea workArea)
+{
+    if ((getFieldTaskPtr()->m2C_currentFieldIndex == 2) && mainGameState.getBit(0xA2 * 8 + 2) != 0)
+    {
+        return;
+    }
+
+    createSubTaskFromFunction<s_fieldA3_0_tutorialTask>(workArea, fieldA3_0_tutorialTask_update);
+}
+
+void fieldA3_0_createItemBoxes(p_workArea workArea)
+{
+    fieldA3_1_createItemBoxes_Sub0(workArea, readItemBoxDefinition({ 0x6091DF4, gFLD_A3 }));
+    fieldA3_1_createItemBoxes_Sub0(workArea, readItemBoxDefinition({ 0x6091E3C, gFLD_A3 }));
+    createFieldItemBox(readItemBoxDefinition({ 0x6091E84, gFLD_A3 }));
+    fieldA3_1_createItemBoxes_Sub0(workArea, readItemBoxDefinition({ 0x6091ECC, gFLD_A3 }));
+    fieldA3_1_createItemBoxes_Sub0(workArea, readItemBoxDefinition({ 0x6091F14, gFLD_A3 }));
+    createFieldItemBox(readItemBoxDefinition({ 0x6091F5C, gFLD_A3 }));
+    createFieldItemBox(readItemBoxDefinition({ 0x6091FA4, gFLD_A3 }));
+    createFieldItemBox(readItemBoxDefinition({ 0x6091FEC, gFLD_A3 }));
+}
+
+const std::array<s16, 8> A3_0_exitsVars =
+{
+    1262, 1263, 1264, 1265, 1266, 1267, 1268, 1269
+};
+
+static const std::array<s8, 8> A3_0_exitsLocations =
+{
+    4, 4, 5, 5, 6, 6, 10, 8
+};
+
+struct sfieldA3_0_checkExitsTask : public s_workAreaTemplate<sfieldA3_0_checkExitsTask>
+{
+    static void Update(sfieldA3_0_checkExitsTask* pThis)
+    {
+        for (int i = 0; i < 8; i++)
+        {
+            if (getFieldSpecificData_A3()->m94_A3_0_exits[i])
+            {
+                mainGameState.setBit566(A3_0_exitsVars[i]);
+
+                // Hack: this is in the function to be initialized after gFLD_A3
+                static const std::array<sSaturnPtr, 8> A3_0_exitsCutscenes =
+                {
+                    {
+                        {0x6090EB8, gFLD_A3},
+                        {0x6090F20, gFLD_A3},
+                        {0x6090F88, gFLD_A3},
+                        {0x0, gFLD_A3},
+                        {0x0, gFLD_A3},
+                        {0x60910C0, gFLD_A3},
+                        {0x0, gFLD_A3},
+                        {0x0, gFLD_A3},
+                    }
+                };
+
+                if (A3_0_exitsCutscenes[i].m_offset)
+                {
+                    startExitFieldCutscene(pThis, readCameraScript(A3_0_exitsCutscenes[i]), A3_0_exitsLocations[i], i, 0x8000);
+                }
+                else
+                {
+                    //6056A70
+                    static const std::array<sSaturnPtr, 8> A3_0_exitsCutscenes2 =
+                    {
+                        {
+                            {0, gFLD_A3},
+                            {0, gFLD_A3},
+                            {0, gFLD_A3},
+                            {0x609176C, gFLD_A3},
+                            {0x6091850, gFLD_A3},
+                            {0, gFLD_A3},
+                            {0x6091A18, gFLD_A3},
+                            {0x6091AFC, gFLD_A3},
+                        }
+                    };
+
+                    startExitFieldCutscene2(pThis, loadCutsceneData(A3_0_exitsCutscenes2[i]), A3_0_exitsLocations[i], i, 0x8000);
+                }
+
+                //6056A86
+                pThis->m_UpdateMethod = NULL;
+            }
+        }
+    }
+};
+
+void fieldA3_0_createCheckExitTask(p_workArea workArea)
+{
+    createSubTaskFromFunction<sfieldA3_0_checkExitsTask>(workArea, &sfieldA3_0_checkExitsTask::Update);
+}
+
+void fieldA3_0_exitFunction_0(p_workArea, sLCSTarget*)
+{
+    getFieldSpecificData_A3()->m94_A3_0_exits[0] = 1;
+}
+
+void fieldA3_0_exitFunction_1(p_workArea, sLCSTarget*)
+{
+    getFieldSpecificData_A3()->m94_A3_0_exits[1] = 1;
+}
+
+void fieldA3_0_exitFunction_2(p_workArea, sLCSTarget*)
+{
+    getFieldSpecificData_A3()->m94_A3_0_exits[2] = 1;
+}
+
+void fieldA3_0_exitFunction_3(p_workArea, sLCSTarget*)
+{
+    getFieldSpecificData_A3()->m94_A3_0_exits[3] = 1;
+}
+
+void fieldA3_0_exitFunction_4(p_workArea, sLCSTarget*)
+{
+    getFieldSpecificData_A3()->m94_A3_0_exits[4] = 1;
+}
+
+void fieldA3_0_exitFunction_5(p_workArea, sLCSTarget*)
+{
+    getFieldSpecificData_A3()->m94_A3_0_exits[5] = 1;
+}
+
+void fieldA3_0_exitFunction_6(p_workArea, sLCSTarget*)
+{
+    getFieldSpecificData_A3()->m94_A3_0_exits[6] = 1;
+}
+
+void fieldA3_0_exitFunction_7(p_workArea, sLCSTarget*)
+{
+    getFieldSpecificData_A3()->m94_A3_0_exits[7] = 1;
+}
+
+void(*fieldA3_0_exitFunctionTable[])(p_workArea, sLCSTarget*) = {
+    fieldA3_0_exitFunction_0,
+    fieldA3_0_exitFunction_1,
+    fieldA3_0_exitFunction_2,
+    fieldA3_0_exitFunction_3,
+    fieldA3_0_exitFunction_4,
+    fieldA3_0_exitFunction_5,
+    fieldA3_0_exitFunction_6,
+    fieldA3_0_exitFunction_7,
+};
+
+struct sfieldA3_0_createExitTask : public s_workAreaTemplate<sfieldA3_0_createExitTask>
+{
+    static TypedTaskDefinition* getTypedTaskDefinition()
+    {
+        static TypedTaskDefinition taskDefinition = { &sfieldA3_0_createExitTask::Init, &sfieldA3_0_createExitTask::Update, NULL, NULL };
+        return &taskDefinition;
+    }
+
+    static void Init(sfieldA3_0_createExitTask* pThis)
+    {
+        static sVec3_FP fieldA3_0_exitPosition[8];
+
+        for (s32 r12 = 7; r12 >= 0; r12--)
+        {
+            fixedPoint rotation = readSaturnFP({ 0x6081E64 + 4 * r12, gFLD_A3 });
+            pThis->m1A0_rotation[r12].m0_X = getSin(rotation.getInteger() & 0xFFF) >> 4;
+            pThis->m1A0_rotation[r12].m4_Y = 0;
+            pThis->m1A0_rotation[r12].m8_Z = getCos(rotation.getInteger() & 0xFFF) >> 4;
+
+            fieldA3_0_exitPosition[r12] = readSaturnVec3({ 0x6081DA4 + 4 * 3 * r12, gFLD_A3 });
+
+            createLCSTarget(&pThis->m0_LCSTargets[r12], pThis, fieldA3_0_exitFunctionTable[r12], &fieldA3_0_exitPosition[r12], &pThis->m1A0_rotation[r12], 3, 0, eItems::mMinusOne, 0, 0);
+
+            getFieldSpecificData_A3()->m94_A3_0_exits[r12] = 0;
+        }
+    }
+
+    static void Update(sfieldA3_0_createExitTask* pThis)
+    {
+        for (int r12 = 7; r12 >= 0; r12--)
+        {
+            updateLCSTarget(&pThis->m0_LCSTargets[r12]);
+        }
+    }
+
+    std::array<sLCSTarget, 8> m0_LCSTargets; // stride is 0x34
+    std::array<sVec3_FP, 8> m1A0_rotation;
+    // size 0x200
+};
+
+void create_fieldA3_0_exitTask(p_workArea workArea)
+{
+    createSubTask<sfieldA3_0_createExitTask>(workArea);
+}
+
+// 0605795a
+struct s_fieldA3_0_task6 : public s_workAreaTemplate<s_fieldA3_0_task6>
+{
+    static TypedTaskDefinition* getTypedTaskDefinition()
+    {
+        static TypedTaskDefinition taskDefinition = { &s_fieldA3_0_task6::Init, &s_fieldA3_0_task6::Update, NULL, NULL };
+        return &taskDefinition;
+    }
+    static void Init(s_fieldA3_0_task6* pThis)
+    {
+        if ((mainGameState.bitField[0xa2] & 0x10) == 0)
+        {
+            pThis->m0_position[0] = 0x183000;
+            pThis->m0_position[1] = 0xFFFF0000;
+            pThis->m0_position[2] = 0xFE9BC000;
+        }
+        else
+        {
+            pThis->m0_position[0] = 0x70B000;
+            pThis->m0_position[1] = 0xFFFF0000;
+            pThis->m0_position[2] = 0xFED98000;
+        }
+    }
+    static void Update(s_fieldA3_0_task6*) {}
+
+    sVec3_FP m0_position;
+    // size 0xC
+};
+
+// 06057aa6
+void create_fieldA3_0_task6(p_workArea workArea)
+{
+    createSubTask<s_fieldA3_0_task6>(workArea);
+}
+
+// 0605ee54
+struct s_fieldA3_0_task8 : public s_workAreaTemplate<s_fieldA3_0_task8>
+{
+    static TypedTaskDefinition* getTypedTaskDefinition()
+    {
+        static TypedTaskDefinition taskDefinition = { &s_fieldA3_0_task8::Init, &s_fieldA3_0_task8::Update, NULL, &s_fieldA3_0_task8::Delete };
+        return &taskDefinition;
+    }
+    static void Init(s_fieldA3_0_task8*)
+    {
+        s_fieldSpecificData_A3* pData = getFieldSpecificData_A3();
+        pData->m158[0] = 0;
+        pData->m158[1] = 0;
+        pData->m158[2] = 0;
+        pData->m154 = 0;
+    }
+    static void Update(s_fieldA3_0_task8*)
+    {
+        s_fieldSpecificData_A3* pData = getFieldSpecificData_A3();
+        if (pData->m154 == 0)
+        {
+            playBattleSoundEffect(0x66);
+        }
+        else
+        {
+            sVec3_FP transformedPos;
+            transformAndAddVecByCurrentMatrix(&pData->m158, &transformedPos);
+            s32 found = findSound(0x66);
+            if ((s8)found < 0)
+            {
+                startPositionalSound(0x66, &transformedPos);
+            }
+            else
+            {
+                updatePositionalSound(0x66, &transformedPos);
+            }
+            pData->m158[0] = 0;
+            pData->m158[2] = 0;
+            pData->m154 = 0;
+        }
+    }
+    static void Delete(s_fieldA3_0_task8*)
+    {
+        playBattleSoundEffect(0x66);
+    }
+};
+
+// 0605ee86
+void create_fieldA3_0_task8(p_workArea workArea)
+{
+    createSubTask<s_fieldA3_0_task8>(workArea);
+}
+
+void fieldA3_0_startTasks(p_workArea workArea)
+{
+    fieldA3_0_createTask0(workArea);
+
+    getFieldSpecificData_A3()->m168_particlePool = createParticlePoolTask(workArea, 2, 0x20);
+
+    create_fieldA3_0_exitTask(workArea);
+
+    create_fieldA3_backgroundLayer(workArea);
+
+    create_fieldA3_0_task4(workArea);
+
+    fieldA3_0_createCheckExitTask(workArea);
+
+    create_fieldA3_0_task6(workArea);
+
+    fieldA3_0_createItemBoxes(workArea);
+
+    create_fieldA3_0_task8(workArea);
+
+    create_fieldA3_0_tutorialTask(workArea);
+}
+
+void setupFieldCameraConfig_A3_0()
+{
+    setupFieldCameraConfigs(readCameraConfig({ 0x6081F44, gFLD_A3 }), 1);
+}
+
+void subfieldA3_0(p_workArea workArea)
+{
+    playPCM(workArea, 100);
+    playPCM(workArea, 101);
+
+    s_DataTable3* pDataTable3 = readDataTable3({ 0x6085AA4, gFLD_A3 });
+    std::vector<std::vector<sCameraVisibility>>* pVisibility = readCameraVisbility({ 0x608F410, gFLD_A3 }, pDataTable3);
+    s_DataTable2* pDataTable2 = readDataTable2({ 0x6083D3C, gFLD_A3 });
+    setupField(pDataTable3, pDataTable2, fieldA3_0_startTasks, pVisibility);
+
+    getFieldTaskPtr()->m8_pSubFieldData->m338_pDragonTask->mF4 = subfieldA3_0Sub0;
+
+    {
+        sVec3_FP position = { 0x28A000, 0x32000, -0x1294000 };
+        sVec3_FP rotation = { 0x0, 0x4000000, 0x0 };
+        setupDragonPosition(&position, &rotation);
+    }
+
+    if (getFieldTaskPtr()->m30_fieldEntryPoint != -1)
+    {
+        if (getFieldTaskPtr()->m2C_currentFieldIndex == 21)
+        {
+            {
+                sVec3_FP position = { 0x2EF000, 0x3C000, -0x2D1000 };
+                sVec3_FP rotation = { 0x0, 0x16C16C, 0x0 };
+                setupDragonPosition(&position, &rotation);
+            }
+
+            graphicEngineStatus.m405C.m14_farClipDistance = 0x2AE000;
+            graphicEngineStatus.m405C.m38_oneOverFarClip = FP_Div(0x8000, 0x2AE000);
+
+            graphicEngineStatus.m405C.m34_oneOverFarClip256 = graphicEngineStatus.m405C.m38_oneOverFarClip << 8;
+        }
+        else
+        {
+            //060542E4
+            switch (getFieldTaskPtr()->m32_previousSubField)
+            {
+            case 4:
+                if (getFieldTaskPtr()->m30_fieldEntryPoint)
+                {
+                    getFieldTaskPtr()->m8_pSubFieldData->m338_pDragonTask->m1D0_cameraScript = readCameraScript({ 0x6090F54, gFLD_A3 });
+                }
+                else
+                {
+                    getFieldTaskPtr()->m8_pSubFieldData->m338_pDragonTask->m1D0_cameraScript = readCameraScript({ 0x6090EEC, gFLD_A3 });
+                }
+                break;
+            case 5:
+                if (getFieldTaskPtr()->m30_fieldEntryPoint)
+                {
+                    getFieldTaskPtr()->m8_pSubFieldData->m338_pDragonTask->m1D0_cameraScript = readCameraScript({ 0x6091024, gFLD_A3 });
+                }
+                else
+                {
+                    getFieldTaskPtr()->m8_pSubFieldData->m338_pDragonTask->m1D0_cameraScript = readCameraScript({ 0x6090FBC, gFLD_A3 });
+                }
+                break;
+            case 6:
+                if (getFieldTaskPtr()->m30_fieldEntryPoint)
+                {
+                    startCutscene(loadCutsceneData({ 0x6091934, gFLD_A3 }));
+                }
+                else
+                {
+                    getFieldTaskPtr()->m8_pSubFieldData->m338_pDragonTask->m1D0_cameraScript = readCameraScript({ 0x609108C, gFLD_A3 });
+                }
+                break;
+            case 8:
+                getFieldTaskPtr()->m8_pSubFieldData->m338_pDragonTask->m1D0_cameraScript = readCameraScript({ 0x609115C, gFLD_A3 });
+                break;
+            case 10:
+                getFieldTaskPtr()->m8_pSubFieldData->m338_pDragonTask->m1D0_cameraScript = readCameraScript({ 0x6091128, gFLD_A3 });
+                startFieldScript(17, -1);
+                break;
+            default:
+                getFieldTaskPtr()->m8_pSubFieldData->m338_pDragonTask->m1D0_cameraScript = readCameraScript({ 0x6090E84, gFLD_A3 });
+                startFieldScript(17, -1);
+                break;
+            }
+        }
+    }
+    //060543E0
+    initFieldDragonLight();
+
+    createFieldPaletteTask(workArea);
+
+    setupFieldCameraConfig_A3_0();
+
+    adjustVerticalLimits(-0x5A000, 0x76000);
+
+    fieldRadar_enableAltitudeGauge();
+
+    getFieldTaskPtr()->m8_pSubFieldData->m344_randomBattleTask->m0 = nullBattle;
+
+    fieldRadar_initDestinations(0x1a);
+}

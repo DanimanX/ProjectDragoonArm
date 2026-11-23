@@ -1,0 +1,29 @@
+{
+  "version": 4,
+  "name": "panzerdragoon.zip",
+  "items": [
+    "Panzer Dragoon Saga.sh",
+    "panzerdragoon/"
+  ],
+  "items_opt": [],
+  "attr": {
+    "title": "Panzer Dragoon Saga",
+    "porter": ["DanimanX"],
+    "desc": "Panzer Dragoon Saga (Sega Saturn, 1998) running natively on ARM64: the reverse-engineered Azel engine with Saturn VDP1/VDP2 presentation translated to OpenGL ES 3. No emulation. Supply your own disc dump.",
+    "desc_md": null,
+    "inst_md": "Extract your own legally dumped USA disc set with `tools/extract_disc.py` into `panzerdragoon/data/disc1`. Disc 1 is hash-verified against blythos/atolm's sha256 manifest.",
+    "genres": ["rpg"],
+    "image": {},
+    "rtr": false,
+    "exp": false,
+    "runtime": [],
+    "store": {},
+    "availability": "paid",
+    "reqs": [[">=glibc2.28"]],
+    "status": {
+      "source": "https://github.com/DanimanX/ProjectDragoonArm",
+      "license": "MIT",
+      "notes": "Engine: yaz0r/Azel (MIT). Disc identity manifests: blythos/atolm (MIT). Not affiliated with SEGA."
+    }
+  }
+}
