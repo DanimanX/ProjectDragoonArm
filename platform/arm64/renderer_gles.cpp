@@ -904,6 +904,12 @@ enum { PD_A = 0x0001, PD_B = 0x0002, PD_C = 0x0004, PD_START = 0x0008,
 
 static int evdevOpenPad()
 {
+    static bool loggedMissing = false;
+    static Uint64 lastScan = 0;
+    const Uint64 now = SDL_GetTicks();
+    if (lastScan != 0 && now - lastScan < 2000) return -1;
+    lastScan = now;
+
     char path[64];
     for (int i = 0; i < 16; ++i)
     {
@@ -916,12 +922,17 @@ static int evdevOpenPad()
         {
             g_evFd = fd;
             g_evMask = 0;
+            loggedMissing = false;
             fprintf(stderr, "[input] evdev pad: %s (%s)\n", name, path);
             return fd;
         }
         close(fd);
     }
-    fprintf(stderr, "[input] evdev: no controller found\n");
+    if (!loggedMissing)
+    {
+        loggedMissing = true;
+        fprintf(stderr, "[input] evdev: no controller found\n");
+    }
     return -1;
 }
 

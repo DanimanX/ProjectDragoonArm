@@ -301,14 +301,15 @@ void azelSdl_StartFrame()
             | BGFX_SAMPLER_V_CLAMP
             ;
 
+        // vdp1PriorityTexture was only used by the dead renderVdp1WithPriority
+        // path; VDP2_composite_ps decodes priority from vdp1BufferTexture.a.
+        // Keeping only color + depth avoids an unused 720x540 MRT attachment.
         vdp1BufferTexture = bgfx::createTexture2D(internalResolution[0], internalResolution[1], false, 0, bgfx::TextureFormat::BGRA8, BGFX_TEXTURE_RT | tsFlags);
-        vdp1PriorityTexture = bgfx::createTexture2D(internalResolution[0], internalResolution[1], false, 0, bgfx::TextureFormat::R8, BGFX_TEXTURE_RT | tsFlags);
         vdp1DepthBufferTexture = bgfx::createTexture2D(internalResolution[0], internalResolution[1], false, 0, bgfx::TextureFormat::D24S8, BGFX_TEXTURE_RT | tsFlags);
-        std::array<bgfx::Attachment, 3> vdp1BufferAt;
+        std::array<bgfx::Attachment, 2> vdp1BufferAt;
         vdp1BufferAt[0].init(vdp1BufferTexture);
-        vdp1BufferAt[1].init(vdp1PriorityTexture);
-        vdp1BufferAt[2].init(vdp1DepthBufferTexture);
-        gBGFXVdp1PolyFB = bgfx::createFrameBuffer(3, &vdp1BufferAt[0], true);
+        vdp1BufferAt[1].init(vdp1DepthBufferTexture);
+        gBGFXVdp1PolyFB = bgfx::createFrameBuffer(2, &vdp1BufferAt[0], true);
 
         u_spritePriority = bgfx::createUniform("u_spritePriority", bgfx::UniformType::Vec4);
 
@@ -1638,15 +1639,12 @@ bool azelSdl_EndFrame()
     u32 vdp2ResolutionWidth = outputResolutionWidth;
     u32 vdp2ResolutionHeight = outputResolutionHeight;
 
+    if (!useVDP1GL)
     {
         vdp1TextureWidth = outputResolutionWidth;
         vdp1TextureHeight = outputResolutionHeight;
         vdp1TextureOutput.resize(vdp1TextureWidth * vdp1TextureHeight);
         memset(&vdp1TextureOutput[0], 0x00, vdp1TextureWidth * vdp1TextureHeight * 4);
-    }
-
-    if (!useVDP1GL)
-    {
         renderVdp1();
     }
 
@@ -1657,9 +1655,24 @@ bool azelSdl_EndFrame()
         static const bool skipUpload = getenv("PD_SKIP_VRAM_UPLOAD") != nullptr;
         if (!skipUpload)
         {
-            bgfx::updateTexture2D(bgfx_vdp1_ram_texture, 0, 0, 0, 0, 256, 0x80000 / 256, bgfx::makeRef(getVdp1Pointer(0x25C00000), 0x80000));
-            bgfx::updateTexture2D(bgfx_vdp2_ram_texture, 0, 0, 0, 0, 256, 0x80000 / 256, bgfx::makeRef(getVdp2Vram(0), 0x80000));
-            bgfx::updateTexture2D(bgfx_vdp2_cram_texture, 0, 0, 0, 0, 256, 0x1000 / 256, bgfx::makeRef(getVdp2Cram(0), 0x1000));
+            // bgfx_vdp1_ram_texture is never sampled by any shader; skip the
+            // 512 KB/frame upload. For VDP2 VRAM/CRAM, only re-upload when the
+            // contents actually changed, avoiding Mali's texture-in-use stalls
+            // during 3D field frames where VDP2 tiles are static.
+            static std::vector<u8> lastVdp2Ram;
+            static std::vector<u8> lastVdp2Cram;
+            const u8* curVdp2Ram = getVdp2Vram(0);
+            const u8* curVdp2Cram = getVdp2Cram(0);
+            if (lastVdp2Ram.size() != 0x80000 || memcmp(lastVdp2Ram.data(), curVdp2Ram, 0x80000) != 0)
+            {
+                lastVdp2Ram.assign(curVdp2Ram, curVdp2Ram + 0x80000);
+                bgfx::updateTexture2D(bgfx_vdp2_ram_texture, 0, 0, 0, 0, 256, 0x80000 / 256, bgfx::makeRef(curVdp2Ram, 0x80000));
+            }
+            if (lastVdp2Cram.size() != 0x1000 || memcmp(lastVdp2Cram.data(), curVdp2Cram, 0x1000) != 0)
+            {
+                lastVdp2Cram.assign(curVdp2Cram, curVdp2Cram + 0x1000);
+                bgfx::updateTexture2D(bgfx_vdp2_cram_texture, 0, 0, 0, 0, 256, 0x1000 / 256, bgfx::makeRef(curVdp2Cram, 0x1000));
+            }
         }
     }
 

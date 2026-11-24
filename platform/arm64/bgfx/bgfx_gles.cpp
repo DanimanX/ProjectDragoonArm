@@ -213,6 +213,7 @@ enum : GLenum
 	X(void, glUniform1uiv, (GLint, GLsizei, const GLuint*)) \
 	X(GLint, glGetAttribLocation, (GLuint, const GLchar*)) \
 	X(void, glEnableVertexAttribArray, (GLuint)) \
+	X(void, glDisableVertexAttribArray, (GLuint)) \
 	X(void, glVertexAttribPointer, (GLuint, GLint, GLenum, GLboolean, GLsizei, const void*)) \
 	X(void, glVertexAttribIPointer, (GLuint, GLint, GLenum, GLsizei, const void*)) \
 	X(void, glBindAttribLocation, (GLuint, GLuint, const GLchar*)) \
@@ -528,13 +529,30 @@ static void prepareView(bgfx::ViewId id);
 // ---------------------------------------------------------------------------
 namespace bgfx
 {
+	static void pdFreeMemData(void* _ptr, void*) { free(_ptr); }
+
+	static void releaseMem(const Memory* _mem)
+	{
+		if (!_mem) return;
+		if (_mem->release) _mem->release(_mem->data, _mem->userData);
+		free(const_cast<Memory*>(_mem));
+	}
+
 	Memory* Memory::make(size_t _size)
 	{
 		Memory* m = (Memory*)malloc(sizeof(Memory));
-		m->data = (uint8_t*)malloc(_size ? _size : 1);
+		if (_size)
+		{
+			m->data = (uint8_t*)malloc(_size);
+			m->release = pdFreeMemData;
+		}
+		else
+		{
+			m->data = NULL;
+			m->release = NULL;
+		}
 		m->size = (uint32_t)_size;
 		m->offset = 0;
-		m->release = NULL;
 		m->userData = NULL;
 		return m;
 	}
@@ -819,11 +837,24 @@ namespace bgfx
 
 		for (int i = 0; i < 256; ++i) g_views[i].touchedThisFrame = false;
 
-		// orphan transient buffers so the driver need not wait on in-flight draws
-		if (g_transientVbo && g_transientVboCap)
+		// orphan transient buffers so the driver need not wait on in-flight draws.
+		// Must bind the transient buffers explicitly — GL_ARRAY_BUFFER still holds
+		// whichever regular VBO was drawn last (the composite fullscreen quad!),
+		// so calling glBufferData without binding first wiped quad_vertexbuffer.
+		if (g_transientVbo && g_transientVboUsed > 0)
+		{
+			p_glBindVertexArray(0);
+			p_glBindBuffer(GL_ARRAY_BUFFER, g_transientVbo);
 			p_glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)g_transientVboCap, NULL, GL_STREAM_DRAW);
-		if (g_transientIbo && g_transientIboCap)
+			p_glBindBuffer(GL_ARRAY_BUFFER, 0);
+		}
+		if (g_transientIbo && g_transientIboUsed > 0)
+		{
+			p_glBindVertexArray(0);
+			p_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_transientIbo);
 			p_glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)g_transientIboCap, NULL, GL_STREAM_DRAW);
+			p_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+		}
 		g_transientVboUsed = 0;
 		g_transientIboUsed = 0;
 	}
@@ -850,19 +881,21 @@ namespace bgfx
 	{
 		if (!g_transientVbo)
 		{
-			g_transientVboCap = 8u << 20;
+			g_transientVboCap = 1u << 20;
 			g_transientVboMem = (uint8_t*)malloc(g_transientVboCap);
 			p_glGenBuffers(1, &g_transientVbo);
 			p_glBindBuffer(GL_ARRAY_BUFFER, g_transientVbo);
 			p_glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)g_transientVboCap, NULL, GL_STREAM_DRAW);
+			p_glBindBuffer(GL_ARRAY_BUFFER, 0);
 		}
 		if (!g_transientIbo)
 		{
-			g_transientIboCap = 2u << 20;
+			g_transientIboCap = 256u << 10;
 			g_transientIboMem = (uint8_t*)malloc(g_transientIboCap);
 			p_glGenBuffers(1, &g_transientIbo);
 			p_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_transientIbo);
 			p_glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)g_transientIboCap, NULL, GL_STREAM_DRAW);
+			p_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 		}
 		if (!g_transientVao)
 		{
@@ -1022,6 +1055,19 @@ namespace bgfx
 			body.replace(at, from.size(), to);
 			fprintf(stderr, "[gles] shader patch applied: %s\n", what);
 		};
+		if (strstr(label, "VDP1_ps") != nullptr)
+		{
+			// VDP1_ps samples RGBA32F corner textures (s_ndcCorners, s_objCorners)
+			// and runs an inverse-bilinear quadratic solver per fragment. The
+			// transpiled ESSL declares those reads and intermediates `lowp`, which
+			// Mali-G31 executes as FP16 (10-bit mantissa -> broken UVs/NaN).
+			for (size_t at = body.find("lowp ");
+			     at != std::string::npos;
+			     at = body.find("lowp ", at + 1))
+			{
+				body.replace(at, 5, "highp ");
+			}
+		}
 		if (strstr(label, "VDP2") != nullptr)
 		{
 			// The transpiled source declares every texture read as
@@ -1040,6 +1086,15 @@ namespace bgfx
 		}
 		if (strstr(label, "composite") != nullptr)
 		{
+			// In GLES (originBottomLeft), VDP2 layers write Saturn row 0 at
+			// gl_FragCoord.y=0 (texture v=0), while VDP1 writes Saturn row 0 at
+			// gl_Position.y=+1 (texture v=1). VDP2_blit_vs flips v_texcoord0.y so
+			// VDP2 lands right-side up; flip s_vdp1Color back so VDP1 matches.
+			pdPatch(body,
+			        "tmpvar_23 = texture (s_vdp1Color, v_texcoord0);",
+			        "tmpvar_23 = texture (s_vdp1Color, vec2(v_texcoord0.x, 1.0 - v_texcoord0.y));",
+			        "vdp1 composite Y flip");
+
 			// PD_COMPOSITE_MODE replaces the composite result with one input, so
 			// "the screen is black" can be attributed to a specific layer instead
 			// of reasoned about from the shader text:
@@ -1374,8 +1429,6 @@ namespace bgfx
 		bool integer = false;
 		fmt = toGLFormat(_format, internal, type, integer);
 
-		p_glGenTextures(1, &t->id);
-		p_glBindTexture(GL_TEXTURE_2D, t->id);
 		t->w = _width; t->h = _height;
 		t->format = _format;
 		t->isRT = (_flags & BGFX_TEXTURE_RT) != 0;
@@ -1388,11 +1441,13 @@ namespace bgfx
 			p_glBindRenderbuffer(GL_RENDERBUFFER, t->id);
 			p_glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, _width, _height);
 			p_glBindRenderbuffer(GL_RENDERBUFFER, 0);
-			if (_mem && _mem->release) _mem->release(_mem->data, _mem->userData);
+			releaseMem(_mem);
 			return handle;
 		}
 		else
 		{
+			p_glGenTextures(1, &t->id);
+			p_glBindTexture(GL_TEXTURE_2D, t->id);
 			p_glTexImage2D(GL_TEXTURE_2D, 0, (GLint)internal, _width, _height, 0, fmt, type,
 			               (_mem && _mem->data) ? _mem->data : NULL);
 			if (glDiagEnabled())
@@ -1401,11 +1456,9 @@ namespace bgfx
 					        e, internal, fmt, type);
 		}
 
-		// Integer textures cannot be filtered: GL only allows NEAREST for them,
-		// and any other filter makes the texture incomplete, so every texelFetch
-		// in the VDP2 shaders would read zero. This is why the layers rendered
-		// black before the port forced NEAREST here.
-		const bool point = integer || (_flags & (BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT)) != 0;
+		// Integer and 32-bit float textures cannot be linearly filtered in core
+		// GLES 3.0 (non-NEAREST makes them incomplete, so fetches return 0).
+		const bool point = integer || type == GL_FLOAT || (_flags & (BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT)) != 0;
 		const GLint filt = point ? GL_NEAREST : GL_LINEAR;
 		p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filt);
 		p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filt);
@@ -1418,7 +1471,7 @@ namespace bgfx
 			if (GLenum err = p_glGetError())
 				fprintf(stderr, "[gles] createTexture2D(%ux%u fmt %d) gl error 0x%x\n",
 				        _width, _height, (int)_format, err);
-		if (_mem && _mem->release) _mem->release(_mem->data, _mem->userData);
+		releaseMem(_mem);
 		return handle;
 	}
 
@@ -1492,7 +1545,7 @@ namespace bgfx
 				}
 			}
 		}
-		if (_mem->release) _mem->release(_mem->data, _mem->userData);
+		releaseMem(_mem);
 	}
 
 	// Port diagnostic: read the bound backbuffer (whatever the port is about to
@@ -1643,7 +1696,8 @@ namespace bgfx
 		p_glBindBuffer(GL_ARRAY_BUFFER, b->id);
 		p_glBufferData(GL_ARRAY_BUFFER, _mem ? (GLsizeiptr)_mem->size : 0,
 		               _mem ? _mem->data : NULL, GL_STATIC_DRAW);
-		if (_mem && _mem->release) _mem->release(_mem->data, _mem->userData);
+		p_glBindBuffer(GL_ARRAY_BUFFER, 0);
+		releaseMem(_mem);
 		return handle;
 	}
 
@@ -1658,7 +1712,8 @@ namespace bgfx
 		p_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, b->id);
 		p_glBufferData(GL_ELEMENT_ARRAY_BUFFER, _mem ? (GLsizeiptr)_mem->size : 0,
 		               _mem ? _mem->data : NULL, GL_STATIC_DRAW);
-		if (_mem && _mem->release) _mem->release(_mem->data, _mem->userData);
+		p_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+		releaseMem(_mem);
 		return handle;
 	}
 
@@ -1911,10 +1966,10 @@ namespace bgfx
 		}
 		(void)writeA;
 
-		// blending: bgfx packs src|dst in the high 32 bits
-		const uint32_t blendSrc = (uint32_t)(_state >> 32) & 0x1F;
-		const uint32_t blendDst = (uint32_t)(_state >> 32) >> 8 & 0x1F;
-		if (blendSrc || blendDst)
+		// blending: bgfx shim packs src in bits 32..35 and dst in bits 36..39
+		const uint32_t blendSrc = (uint32_t)((_state >> 32) & 0xFu);
+		const uint32_t blendDst = (uint32_t)((_state >> 36) & 0xFu);
+		if ((blendSrc || blendDst) && !(blendSrc == BGFX_STATE_BLEND_ONE && blendDst == BGFX_STATE_BLEND_ZERO))
 		{
 			auto mapBlend = [](uint32_t b) -> GLenum {
 				switch (b)
@@ -1941,9 +1996,10 @@ namespace bgfx
 			p_glDisable(GL_BLEND);
 		}
 
-		// culling
-		if (_state & BGFX_STATE_CULL_CW) { p_glEnable(GL_CULL_FACE); p_glCullFace(GL_BACK); p_glFrontFace(GL_CW); }
-		else if (_state & BGFX_STATE_CULL_CCW) { p_glEnable(GL_CULL_FACE); p_glCullFace(GL_BACK); p_glFrontFace(GL_CCW); }
+		// culling: BGFX_STATE_CULL_CW culls CW faces (so CCW is front);
+		// BGFX_STATE_CULL_CCW culls CCW faces (so CW is front).
+		if (_state & BGFX_STATE_CULL_CW) { p_glEnable(GL_CULL_FACE); p_glCullFace(GL_BACK); p_glFrontFace(GL_CCW); }
+		else if (_state & BGFX_STATE_CULL_CCW) { p_glEnable(GL_CULL_FACE); p_glCullFace(GL_BACK); p_glFrontFace(GL_CW); }
 		else p_glDisable(GL_CULL_FACE);
 
 		// textures
@@ -2002,17 +2058,18 @@ namespace bgfx
 					        (unsigned)(*bufSlot(g_ib)).count, g_ibFirst);
 			}
 		}
-		if (g_tvb && g_tib && g_tvb->data && g_tib->data)
+		if (g_tvb && g_tvb->data)
 		{
 			// bind vertex layout for the transient chunk
+			const uintptr_t vboBase = (uintptr_t)(g_tvb->data - g_transientVboMem);
+			const uintptr_t vboOff = vboBase + (uintptr_t)g_tvbStart * g_tvb->layout.getStride();
 			p_glBindVertexArray(g_transientVao);
 			p_glBindBuffer(GL_ARRAY_BUFFER, g_transientVbo);
-			p_glBufferSubData(GL_ARRAY_BUFFER, (GLintptr)(g_tvb->data - g_transientVboMem),
+			p_glBufferSubData(GL_ARRAY_BUFFER, (GLintptr)vboBase,
 			                  (GLsizeiptr)g_tvb->size, g_tvb->data);
-			p_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_transientIbo);
-			p_glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, (GLintptr)(g_tib->data - g_transientIboMem),
-			                  (GLsizeiptr)g_tib->size, g_tib->data);
 
+			GLuint enabledLocs[Attrib::Count];
+			int numEnabled = 0;
 			const VertexLayout& lay = g_tvb->layout;
 			for (int a = 0; a < Attrib::Count; ++a)
 			{
@@ -2030,11 +2087,34 @@ namespace bgfx
 				default: ty = GL_FLOAT; break;
 				}
 				p_glEnableVertexAttribArray((GLuint)loc);
+				enabledLocs[numEnabled++] = (GLuint)loc;
 				p_glVertexAttribPointer((GLuint)loc, at.num, ty, norm, lay.getStride(),
-				                        (const void*)(uintptr_t)at.offset);
+				                        (const void*)(vboOff + at.offset));
 			}
-			const GLsizei count = (GLsizei)(g_tib->size / sizeof(uint16_t));
-			p_glDrawElements(mode, count, GL_UNSIGNED_SHORT, (const void*)0);
+			if (g_tib && g_tib->data)
+			{
+				const uintptr_t iboBase = (uintptr_t)(g_tib->data - g_transientIboMem);
+				const uintptr_t iboOff = iboBase + (uintptr_t)g_ibFirst * sizeof(uint16_t);
+				p_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_transientIbo);
+				p_glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, (GLintptr)iboBase,
+				                  (GLsizeiptr)g_tib->size, g_tib->data);
+				const GLsizei totalIdx = (GLsizei)(g_tib->size / sizeof(uint16_t));
+				const GLsizei availIdx = (g_ibFirst < (uint32_t)totalIdx) ? (totalIdx - (GLsizei)g_ibFirst) : 0;
+				const GLsizei count = (g_ibCount == UINT32_MAX || (GLsizei)g_ibCount > availIdx) ? availIdx : (GLsizei)g_ibCount;
+				if (count > 0)
+					p_glDrawElements(mode, count, GL_UNSIGNED_SHORT, (const void*)iboOff);
+			}
+			else if (lay.getStride() > 0)
+			{
+				const GLsizei totalVerts = (GLsizei)(g_tvb->size / lay.getStride());
+				const GLsizei availVerts = (g_tvbStart < (uint32_t)totalVerts) ? (totalVerts - (GLsizei)g_tvbStart) : 0;
+				const GLsizei count = (g_tvbCount == UINT32_MAX || (GLsizei)g_tvbCount > availVerts) ? availVerts : (GLsizei)g_tvbCount;
+				if (count > 0)
+					p_glDrawArrays(mode, 0, count);
+			}
+			if (p_glDisableVertexAttribArray)
+				for (int i = 0; i < numEnabled; ++i)
+					p_glDisableVertexAttribArray(enabledLocs[i]);
 			p_glBindVertexArray(0);
 		}
 		else if (isBufHandle(g_vb) && (*bufSlot(g_vb)).used && isBufHandle(g_ib) && (*bufSlot(g_ib)).used)
@@ -2045,6 +2125,9 @@ namespace bgfx
 			if (!s_vao) p_glGenVertexArrays(1, &s_vao);
 			p_glBindVertexArray(s_vao);
 			p_glBindBuffer(GL_ARRAY_BUFFER, vb.id);
+			const uintptr_t vbOff = (uintptr_t)g_vbStart * vb.layout.getStride();
+			GLuint enabledLocs[Attrib::Count];
+			int numEnabled = 0;
 			for (int a = 0; a < Attrib::Count; ++a)
 			{
 				if (!vb.layout.has((Attrib::Enum)a)) continue;
@@ -2059,9 +2142,10 @@ namespace bgfx
 				GLenum ty = at.type == AttribType::Uint8 ? GL_UNSIGNED_BYTE
 				          : at.type == AttribType::Int16 ? GL_SHORT : GL_FLOAT;
 				p_glEnableVertexAttribArray((GLuint)loc);
+				enabledLocs[numEnabled++] = (GLuint)loc;
 				p_glVertexAttribPointer((GLuint)loc, at.num, ty,
 				                        at.normalized ? GL_TRUE : GL_FALSE,
-				                        vb.layout.getStride(), (const void*)(uintptr_t)at.offset);
+				                        vb.layout.getStride(), (const void*)(vbOff + at.offset));
 			}
 			p_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ib.id);
 			GLsizei count = (GLsizei)(g_ibCount == UINT32_MAX ? ib.count - g_ibFirst : g_ibCount);
@@ -2074,6 +2158,9 @@ namespace bgfx
 			else
 				p_glDrawElements(mode, count, GL_UNSIGNED_SHORT,
 				                 (const void*)(uintptr_t)(g_ibFirst * sizeof(uint16_t)));
+			if (p_glDisableVertexAttribArray)
+				for (int i = 0; i < numEnabled; ++i)
+					p_glDisableVertexAttribArray(enabledLocs[i]);
 			p_glBindVertexArray(0);
 			if (glDiagEnabled())
 				if (GLenum e = p_glGetError())
@@ -2122,12 +2209,12 @@ namespace bgfx
 
 	Encoder* begin(bool) { return NULL; }
 	void end(Encoder*) {}
-	void Encoder::setState(uint64_t s, uint32_t c) { setState(s, c); }
-	void Encoder::setUniform(UniformHandle h, const void* v, uint16_t n) { setUniform(h, v, n); }
-	void Encoder::setTexture(uint8_t st, UniformHandle sh, TextureHandle th, uint32_t f) { setTexture(st, sh, th, f); }
-	void Encoder::setVertexBuffer(uint8_t st, VertexBufferHandle h, uint32_t sv, uint32_t nv) { setVertexBuffer(st, h, sv, nv); }
-	void Encoder::setIndexBuffer(IndexBufferHandle h, uint32_t fi, uint32_t ni) { setIndexBuffer(h, fi, ni); }
-	void Encoder::submit(ViewId id, ProgramHandle p, uint32_t d, uint8_t f) { submit(id, p, d, f); }
+	void Encoder::setState(uint64_t s, uint32_t c) { bgfx::setState(s, c); }
+	void Encoder::setUniform(UniformHandle h, const void* v, uint16_t n) { bgfx::setUniform(h, v, n); }
+	void Encoder::setTexture(uint8_t st, UniformHandle sh, TextureHandle th, uint32_t f) { bgfx::setTexture(st, sh, th, f); }
+	void Encoder::setVertexBuffer(uint8_t st, VertexBufferHandle h, uint32_t sv, uint32_t nv) { bgfx::setVertexBuffer(st, h, sv, nv); }
+	void Encoder::setIndexBuffer(IndexBufferHandle h, uint32_t fi, uint32_t ni) { bgfx::setIndexBuffer(h, fi, ni); }
+	void Encoder::submit(ViewId id, ProgramHandle p, uint32_t d, uint8_t f) { bgfx::submit(id, p, d, f); }
 }
 
 // ---------------------------------------------------------------------------
