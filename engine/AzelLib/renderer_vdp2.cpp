@@ -218,10 +218,11 @@ void renderLayerGPU(s_layerData& layerData, u32 textureWidth, u32 textureHeight,
         bgfx::setViewRect(NBGData.viewId, 0, 0, textureWidth, textureHeight);
         bgfx::setViewClear(NBGData.viewId, BGFX_CLEAR_COLOR);
 
+        static const bool traceLayer = getenv("PD_TRACE_FRAME") != nullptr;
+        struct timespec lp, la, lb, lc;
+        if (traceLayer) clock_gettime(CLOCK_MONOTONIC, &lp);
         s_layerDataGPU gpuData = packForGPU(layerData);
         fillWindowData(gpuData, wctlReg, w0eBit, w0aBit);
-        static const bool traceLayer = getenv("PD_TRACE_FRAME") != nullptr;
-        struct timespec la, lb, lc;
         if (traceLayer) clock_gettime(CLOCK_MONOTONIC, &la);
         NBGData.planeDataParity ^= 1u;
         bgfx::TextureHandle planeTex = NBGData.planeDataParity
@@ -243,19 +244,24 @@ void renderLayerGPU(s_layerData& layerData, u32 textureWidth, u32 textureHeight,
         if (traceLayer)
         {
             clock_gettime(CLOCK_MONOTONIC, &lc);
-            static double sUp = 0, sDraw = 0;
-            static unsigned ln_ = 0;
+            // Per-view accumulators. A single shared set (the first attempt)
+            // averaged BG0's cost into whatever layer happened to hit the print,
+            // which produced numbers that contradicted the per-pass timings.
+            static double sPack[256] = {0}, sUp[256] = {0}, sDraw[256] = {0};
+            static unsigned cnt[256] = {0};
             auto ms = [](const struct timespec& x, const struct timespec& y) {
                 return (y.tv_sec - x.tv_sec) * 1000.0 + (y.tv_nsec - x.tv_nsec) / 1e6;
             };
-            sUp += ms(la, lb);
-            sDraw += ms(lb, lc);
-            if (++ln_ % 90 == 0)
+            const unsigned vi = (unsigned)NBGData.viewId & 0xFFu;
+            sPack[vi] += ms(lp, la);
+            sUp[vi] += ms(la, lb);
+            sDraw[vi] += ms(lb, lc);
+            if (++cnt[vi] % 60 == 0)
             {
-                fprintf(stderr, "[layer] view=%u %ux%u planeUpload=%.1fms submit=%.1fms\n",
-                        (unsigned)NBGData.viewId, textureWidth, textureHeight,
-                        sUp / 90, sDraw / 90);
-                sUp = sDraw = 0;
+                fprintf(stderr, "[layer] view=%u %ux%u pack=%.2fms upload=%.2fms submit=%.2fms\n",
+                        vi, textureWidth, textureHeight,
+                        sPack[vi] / 60, sUp[vi] / 60, sDraw[vi] / 60);
+                sPack[vi] = sUp[vi] = sDraw[vi] = 0;
             }
         }
 

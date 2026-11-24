@@ -1615,18 +1615,25 @@ bool azelSdl_EndFrame()
     }
 
     static const bool traceRender = getenv("PD_TRACE_FRAME") != nullptr;
+    // PD_SYNC_PASSES=1 puts a GPU drain between render passes. That gives
+    // per-pass GPU cost, but it also serialises them and changes what the
+    // frame-start drain measures, so it must be off for total-frame numbers.
+    static const bool syncPasses = getenv("PD_SYNC_PASSES") != nullptr;
     struct timespec ra, rb, rc, rd, re;
     if (traceRender) clock_gettime(CLOCK_MONOTONIC, &ra);
 
     struct timespec b0, b1, b2, b3;
     if (traceRender) clock_gettime(CLOCK_MONOTONIC, &b0);
     renderBG0(vdp2ResolutionWidth, vdp2ResolutionHeight, BG0_GPU);
-    if (traceRender) { pd_gpu_sync(); clock_gettime(CLOCK_MONOTONIC, &b1); }
+    if (traceRender && syncPasses) { pd_gpu_sync(); clock_gettime(CLOCK_MONOTONIC, &b1); }
+    else if (traceRender) clock_gettime(CLOCK_MONOTONIC, &b1);
     renderBG1(vdp2ResolutionWidth, vdp2ResolutionHeight, BG1_GPU);
-    if (traceRender) { pd_gpu_sync(); clock_gettime(CLOCK_MONOTONIC, &b2); }
+    if (traceRender && syncPasses) { pd_gpu_sync(); clock_gettime(CLOCK_MONOTONIC, &b2); }
+    else if (traceRender) clock_gettime(CLOCK_MONOTONIC, &b2);
     //renderBG2(vdp2ResolutionWidth, vdp2ResolutionHeight);
     renderBG3(vdp2ResolutionWidth, vdp2ResolutionHeight, BG3_GPU);
-    if (traceRender) { pd_gpu_sync(); clock_gettime(CLOCK_MONOTONIC, &b3); }
+    if (traceRender && syncPasses) { pd_gpu_sync(); clock_gettime(CLOCK_MONOTONIC, &b3); }
+    else if (traceRender) clock_gettime(CLOCK_MONOTONIC, &b3);
     renderRBG0(vdp2ResolutionWidth, vdp2ResolutionHeight, RBG0_GPU);
 
     if(!isShipping())
@@ -1794,9 +1801,11 @@ bool azelSdl_EndFrame()
 
         if (useVDP1GL)
         {
-            if (traceRender) { pd_gpu_sync(); clock_gettime(CLOCK_MONOTONIC, &rb); }
+            if (traceRender && syncPasses) { pd_gpu_sync(); clock_gettime(CLOCK_MONOTONIC, &rb); }
+    else if (traceRender) clock_gettime(CLOCK_MONOTONIC, &rb);
             renderVdp1ToGL(internalResolution[0], internalResolution[1]);
-            if (traceRender) { pd_gpu_sync(); clock_gettime(CLOCK_MONOTONIC, &rc); }
+            if (traceRender && syncPasses) { pd_gpu_sync(); clock_gettime(CLOCK_MONOTONIC, &rc); }
+            else if (traceRender) clock_gettime(CLOCK_MONOTONIC, &rc);
         }
     }
     
@@ -1816,7 +1825,8 @@ bool azelSdl_EndFrame()
         // TODOL set the bgfx back color to this color
 
         renderComposite(CompositeView, backScreenColor);
-        if (traceRender) { pd_gpu_sync(); clock_gettime(CLOCK_MONOTONIC, &rd); }
+        if (traceRender && syncPasses) { pd_gpu_sync(); clock_gettime(CLOCK_MONOTONIC, &rd); }
+        else if (traceRender) clock_gettime(CLOCK_MONOTONIC, &rd);
     }
 #endif
 

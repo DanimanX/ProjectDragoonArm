@@ -79,44 +79,44 @@ but not proven. Last updated: 2026-11-24.
   | `bgfx::frame()` | 2 ms |
   | `StartFrame`, tasks, audio | 0.0 ms |
 
-  **Two corrections, both earned by measuring again.**
+  **Settled, after two wrong turns worth recording.**
 
-  First: per-phase CPU timers do not attribute GPU cost. GL commands are queued,
-  so a stall surfaces wherever the CPU first waits — an earlier profile blamed
-  BG0 in one scene and VDP1 in another for the same workload.
+  Wrong turn 1: per-pass CPU timers cannot attribute GPU cost, because GL
+  commands queue — the stall appears wherever the CPU first waits. That made one
+  profile blame BG0 and the next blame VDP1 for identical work.
 
-  Second, and more important: after adding a real GPU drain (`glFinish` at the
-  top of the frame), the drain measures **0.4-0.7 ms even while the game runs at
-  7.4 fps**. So the GPU is idle; the field's 135 ms frame is CPU time, not GPU
-  time. Every claim that the field "starves the GPU" was wrong.
+  Wrong turn 2: adding a GPU drain *between* passes, and then reading the
+  frame-start drain, made the GPU look idle (0.6 ms) while the game ran at
+  7.4 fps. The drains had already emptied the queue. `PD_SYNC_PASSES` now gates
+  them, so the two kinds of measurement cannot contaminate each other.
 
-  What the timeline actually shows, walking into the field with synthetic input:
+  Clean numbers, no inter-pass syncs, field reached with synthetic input:
 
-  ```
-  fps:  29.9 29.9 29.7 29.8 14.9 14.9 14.9 14.8 7.4 7.8 29.7 7.4 7.5 29.9 ...
-  gpu:   0.4  0.5  0.5  0.5  0.7  0.7  0.7  0.7  0.6  0.7  0.6  0.6  0.6  0.6
-  ```
+  | Measurement | Value |
+  |---|---|
+  | CPU to issue a whole frame (vdp2+vdp1+composite+bgfx::frame) | ~4 ms |
+  | GPU work per frame (frame-start `glFinish` drain) | 47-73 ms |
+  | Frame interval at the low points | ~101 ms (9.9 fps) |
 
-  It alternates between 30 and 7.4 fps while the GPU stays idle, and `present`
-  reports `interval=134 ms` with `avg=0.21 ms`. So the frame is not spent
-  presenting and not spent on the GPU: it is spent somewhere in the per-frame
-  work that has not been accounted for yet.
+  **So the field is GPU-bound, and the CPU side is not the problem.**
 
-  The per-pass `[render]` numbers (BG0 13-15 ms, BG1 8.6 ms, BG3 7.4 ms, VDP1
-  30-65 ms) also sum to less than `EndFrame`, and they are CPU time in our GL
-  layer, not GPU waits. So the next thing to instrument is inside those passes:
-  something in them costs milliseconds of CPU for one quad each.
+  With `PD_SYNC_PASSES=1` (per-pass GPU cost, accepting that it serialises):
+  BG0 13-15 ms, BG1 8.6 ms, BG3 7.4 ms, VDP1 30-65 ms, composite 0.6 ms.
 
-  Also corrected: the compiled ESSL does **not** contain the integer div/mod
-  chain from the `.sc` sources — shaderc folded it to `/256` and `/255.0`. So
-  "integer division per pixel" is not the cause. The shader does contain 33
-  dependent `texelFetch` calls and no loops, which is worth understanding but is
-  not proven to be the cost.
+  And the decisive experiment: rendering BG0 at **half resolution** lowered BG0
+  to 4-7 ms *and also* BG1 to 2.5 ms and BG3 to 2.1 ms. One layer using fewer
+  pixels sped up the others, which is the signature of shared **memory
+  bandwidth**, not shader ALU. That also retires the earlier "integer division
+  per pixel" theory: the compiled ESSL has no such chain (shaderc folded it to
+  /256 and /255.0).
 
-- The half-resolution A/B for BG0 was never successfully validated (early runs
-  read a stale log), so "does the cost scale with pixel count" is still formally
-  unverified. With the corrected method it is no longer the key question: every
-  pass is slow in proportion to its pixels, so the shader is the target.
+  Open: VDP1 is the largest single consumer (30-65 ms) while submitting only
+  4-6 commands per frame, so its cost is fixed per-frame work, not command
+  volume. Finding what that is — most likely a full-panel clear/draw or a
+  full-size texture touched every frame — is the next step.
+
+- The half-resolution A/B for BG0 did run cleanly in the end, and its result
+  (halving one layer sped up the others) is what points at bandwidth.
 
 - Disc swap. All four discs are deployed; only Disc 1 has been exercised.
 - In-game audio balance and whether the mixer restore interferes with anything
