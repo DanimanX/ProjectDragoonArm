@@ -1021,19 +1021,105 @@ namespace bgfx
 			body.replace(at, from.size(), to);
 			fprintf(stderr, "[gles] shader patch applied: %s\n", what);
 		};
+		if (strstr(label, "VDP2") != nullptr)
+		{
+			// The transpiled source declares every texture read as
+			// `lowp int tmpvar_N` (the SPIRV default for an unfiltered integer
+			// read) and then widens it. Mali implements lowp int as 16 bits, so
+			// a plane base above 0x7FFF is truncated: NBG0's map at 0x10000
+			// became 0 and the layer read the font instead of the tile map,
+			// which is the "garbage that looks like text" this port has been
+			// chasing. Force highp for every integer intermediate.
+			for (size_t at = body.find("lowp int ");
+			     at != std::string::npos;
+			     at = body.find("lowp int ", at + 1))
+			{
+				body.replace(at, 9, "highp int ");
+			}
+		}
 		if (strstr(label, "VDP2_ps") != nullptr)
 		{
+			// The scale is selectable because the two references disagree: Azel's
+			// own CPU layer renderer uses characterNumber * 0x20, while Lagi's
+			// working port multiplies the already-quadrupled number by 32 (i.e.
+			// *128). PD_CHAR_SCALE decides which one the panel likes.
+			static int charScale = -1;
+			if (charScale < 0)
+			{
+				const char* e = getenv("PD_CHAR_SCALE");
+				charScale = e ? atoi(e) : 32;
+				if (charScale != 32 && charScale != 128) charScale = 32;
+			}
+			char patched[96];
+			snprintf(patched, sizeof(patched),
+			         "characterOffset_54 = (characterNumber_56 * %d);", charScale);
 			pdPatch(body,
 			        "characterOffset_54 = characterNumber_56;",
-			        "characterOffset_54 = (characterNumber_56 * 32);",
-			        "character offset is 32-byte units");
-			pdPatch(body,
-			        "          paletteOffset_52 = (((\n"
-			        "            (paletteNumber_55 << 4)\n"
-			        "           + dotColor_53) * 2) + (texelValue_10 * 512));",
-			        "          paletteOffset_52 = ((texelValue_4 == 1) ? (dotColor_53 * 2)"
-			        " : ((((paletteNumber_55 << 4) + dotColor_53) * 2) + (texelValue_10 * 512)));",
-			        "256-colour palette index");
+			        patched,
+			        "character offset scale");
+			// PD_PAL_DIRECT=1 makes 8bpp dots index CRAM directly instead of
+			// applying the 4bpp pattern palette number. Lagi documents this as the
+			// fix for "cyan/teal title corruption"; Azel's own CPU renderer does
+			// the opposite. Both are selectable so the panel decides.
+			static int palDirect = -1;
+			if (palDirect < 0)
+			{
+				const char* e = getenv("PD_PAL_DIRECT");
+				palDirect = (e && e[0] == '1') ? 1 : 0;
+			}
+			// PD_VRAM_BASE=<hex>[;W] renders the VDP2 VRAM byte at
+			// BASE + x + y*W instead of the layer colour. It is the only way to
+			// see what the *GPU* has in its VRAM texture, as opposed to what the
+			// CPU array contains: when a layer shows garbage but the CPU-side
+			// dump decodes correctly, the two disagree and this settles where.
+			// PD_PLANE_PROBE=<n> paints the whole layer with planeOffsets[n] as
+			// the GPU sees it: R = (offset >> 16) * 85, G = (offset >> 8) & 0xFF,
+			// B = offset & 0xFF. 0x10000 therefore reads as (85,0,0), 0x20000 as
+			// (170,0,0) and 0 as black.
+			if (const char* pp = getenv("PD_PLANE_PROBE"))
+			{
+				// The border is solid white so the capture says whether the
+				// layer drew at all; only then is the centre colour meaningful.
+				char probe[640];
+				snprintf(probe, sizeof(probe),
+				         "void main ()\n{\n"
+				         "  if (int(gl_FragCoord.x) < 4 || int(gl_FragCoord.y) < 4) {\n"
+				         "    bgfx_FragColor = vec4(1.0, 1.0, 1.0, 1.0); return;\n"
+				         "  }\n"
+				         "  highp uint dbgP = texelFetch(s_planeConfig, ivec2(%d, 0), 0).x;\n"
+				         "  bgfx_FragColor = vec4(float((dbgP >> 16) & 0xFFu) * (85.0 / 255.0),\n"
+				         "                        float((dbgP >> 8) & 0xFFu) / 255.0,\n"
+				         "                        float(dbgP & 0xFFu) / 255.0, 1.0);\n"
+				         "  return;\n",
+				         7 + atoi(pp));
+				pdPatch(body, "void main ()\n{\n", probe, "plane probe");
+			}
+			if (const char* vb = getenv("PD_VRAM_BASE"))
+			{
+				const char* semi = strchr(vb, ';');
+				const long base = strtol(vb, nullptr, 16);
+				const long vw = semi ? atol(semi + 1) : 352;
+				char probe[384];
+				snprintf(probe, sizeof(probe),
+				         "void main ()\n{\n"
+				         "  highp int dbgA = %ld + int(gl_FragCoord.x) + int(gl_FragCoord.y) * %ld;\n"
+				         "  highp int dbgB = dbgA / 256;\n"
+				         "  highp int dbgC = dbgA - dbgB * 256;\n"
+				         "  highp float dbgD = float(int(texelFetch(s_VDP2_RAM, ivec2(dbgC, dbgB), 0).x)) / 255.0;\n"
+				         "  bgfx_FragColor = vec4(dbgD, dbgD, dbgD, 1.0);\n"
+				         "  return;\n",
+				         base, vw);
+				pdPatch(body, "void main ()\n{\n", probe, "vram probe");
+			}
+			if (palDirect)
+				pdPatch(body,
+				        "          paletteOffset_52 = (((\n"
+				        "            (paletteNumber_55 << 4)\n"
+				        "           + dotColor_53) * 2) + (texelValue_10 * 512));",
+				        "          paletteOffset_52 = ((texelValue_4 == 1)"
+				        " ? ((dotColor_53 * 2) + (texelValue_10 * 512))"
+				        " : ((((paletteNumber_55 << 4) + dotColor_53) * 2) + (texelValue_10 * 512)));",
+				        "8bpp palette direct");
 		}
 
 		std::string full = "#version 300 es\n";
@@ -1333,11 +1419,15 @@ namespace bgfx
 				        _handle, (int)t.format, _width, _height, _x, _y, e);
 		{
 			// One-shot proof that the upload landed: compare source vs GPU copy.
-			static bool verified = false;
+			static unsigned verified = 0;
 			static const char* want = getenv("PDS_VERIFY_UPLOAD");
-			if (want && !verified && _width == 256 && _height == 2048)
+			// Check the first few uploads and then one in every 60: the VRAM
+			// texture is rewritten every frame, so a one-shot check only proves
+			// the first frame was right.
+			if (want && _width == 256 && _height == 2048 &&
+			    (verified < 3 || verified % 60 == 0))
 			{
-				verified = true;
+				verified++;
 				size_t srcNonZero = 0;
 				const uint8_t* src = (const uint8_t*)_mem->data;
 				for (size_t i = 0; i < (size_t)_width * _height; ++i) if (src[i]) ++srcNonZero;
@@ -1352,8 +1442,24 @@ namespace bgfx
 				p_glDeleteFramebuffers(1, &fbo);
 				size_t dstNonZero = 0;
 				for (uint8_t b : back) if (b) ++dstNonZero;
-				fprintf(stderr, "[gles] upload check: src nonzero %zu, gpu nonzero %zu (read err 0x%x)\n",
-				        srcNonZero, dstNonZero, rd);
+				size_t diff = 0, firstDiff = 0;
+				for (size_t i = 0; i < (size_t)_width * _height; ++i)
+					if (back[i] != src[i]) { if (!diff) firstDiff = i; ++diff; }
+				fprintf(stderr, "[gles] upload check: src nonzero %zu, gpu nonzero %zu (read err 0x%x) "
+				        "differs %zu bytes, first at 0x%zx (src %02x gpu %02x)\n",
+				        srcNonZero, dstNonZero, rd, diff, firstDiff,
+				        firstDiff < (size_t)_width * _height ? src[firstDiff] : 0,
+				        firstDiff < (size_t)_width * _height ? back[firstDiff] : 0);
+				// PDS_VERIFY_UPLOAD=<dir> also drops both buffers so the
+				// difference can be inspected byte by byte.
+				if (want[0] == '/')
+				{
+					char path[512];
+					snprintf(path, sizeof(path), "%s/gpu_vram.bin", want);
+					if (FILE* f = fopen(path, "wb")) { fwrite(back.data(), 1, back.size(), f); fclose(f); }
+					snprintf(path, sizeof(path), "%s/src_vram.bin", want);
+					if (FILE* f = fopen(path, "wb")) { fwrite(src, 1, (size_t)_width * _height, f); fclose(f); }
+				}
 			}
 		}
 		if (_mem->release) _mem->release(_mem->data, _mem->userData);

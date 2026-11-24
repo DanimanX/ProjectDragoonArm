@@ -2,6 +2,7 @@
 #include <ctime>
 #include <cstdio>
 #include <cstdlib>
+#include <unistd.h>
 #include "renderer_vdp2.h"
 #include "renderer/renderer.h"
 #include "battle/BTL_A3/BTL_A3_map6.h"
@@ -49,6 +50,63 @@ struct s_layerData
 };
 
 // Packed struct matching the VDP2_ps.sc shader layout
+extern u8 vdp2Ram[0x80000];
+extern u8 vdp2CRam[0x1000];
+
+// Millisecond wall clock for the diagnostic traces. clock() is CPU time, which
+// at single-digit fps made a 2 s rate limit behave like a 50 s one.
+static u32 pdNowMs()
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (u32)(t.tv_sec * 1000ull + t.tv_nsec / 1000000ull);
+}
+
+// Port diagnostic: PD_DUMP_VRAM=<prefix> arms a snapshot triggered from outside
+// by creating <prefix>.go. When the trigger appears the current VDP2 VRAM, CRAM
+// and register block are written to <prefix>N.vram/.cram/.regs and the trigger
+// is removed. Time-scheduled snapshots were useless: the screen changes at wall
+// clock times nobody can predict while the movie runs at single-digit fps, so a
+// snapshot and a framebuffer grab could never be matched to one game state.
+static void pdMaybeDumpVram()
+{
+    static const char* prefix = getenv("PD_DUMP_VRAM");
+    if (prefix == nullptr) return;
+    static int taken = 0;
+    char path[512];
+    snprintf(path, sizeof(path), "%s.go", prefix);
+    if (access(path, F_OK) != 0) return;
+    remove(path);
+    snprintf(path, sizeof(path), "%s%d.vram", prefix, taken);
+    bool ok = false;
+    if (FILE* f = fopen(path, "wb")) { fwrite(vdp2Ram, 1, 0x80000, f); fclose(f); ok = true; }
+    snprintf(path, sizeof(path), "%s%d.cram", prefix, taken);
+    if (FILE* f = fopen(path, "wb")) { fwrite(vdp2CRam, 1, 0x1000, f); fclose(f); }
+    // The register block that produced the frame. Offsets match the Saturn
+    // register numbers (m20_BGON sits at byte 0x20), which is how the offline
+    // analyser indexes it.
+    snprintf(path, sizeof(path), "%s%d.regs", prefix, taken);
+    if (FILE* f = fopen(path, "wb"))
+    {
+        fwrite(vdp2Controls.m4_pendingVdp2Regs, 1, sizeof(s_VDP2Regs), f);
+        fclose(f);
+    }
+    fprintf(stderr, "[dump] snapshot %d written (%s)\n", taken, ok ? "ok" : "FAILED");
+    taken++;
+}
+
+// Port diagnostic: PD_NBG_ONLY=<mask> hides layers by masking BGON. The plane
+// and VRAM probes paint the whole layer, so with every layer drawn the top one
+// hides the others; this isolates the layer under test.
+static bool pdLayerOn(u16 bgon, u16 bit)
+{
+    static const u16 mask = [] {
+        const char* e = getenv("PD_NBG_ONLY");
+        return e ? (u16)strtol(e, nullptr, 0) : (u16)0xF;
+    }();
+    return (bgon & bit) != 0 && (mask & bit) != 0;
+}
+
 struct s_layerDataGPU
 {
     u32 CHSZ;           // 0
@@ -124,6 +182,29 @@ static void fillWindowData(s_layerDataGPU& g, u16 wctlReg, u32 w0eBit, u32 w0aBi
 
 void renderLayerGPU(s_layerData& layerData, u32 textureWidth, u32 textureHeight, s_NBG_data& NBGData, u16 wctlReg = 0, u32 w0eBit = 0, u32 w0aBit = 0)
 {
+    // Addressing trace: every input the shader uses to find a pattern, plus the
+    // four plane bases. Rate limited so the log stays readable.
+    if (getenv("PD_TRACE_LAYERS"))
+    {
+        static u32 lastMs = 0;
+        const u32 nowMs = pdNowMs();
+        if (nowMs - lastMs >= 2000)
+        {
+            lastMs = nowMs;
+            fprintf(stderr,
+                    "[plane] view=%u CHSZ=%d CHCN=%d PNB=%d CNSM=%d PLSZ=%d CAOS=%d "
+                    "SCN=0x%02x SPN=%d scroll=%d,%d planes=%x,%x,%x,%x tex=%ux%u\n",
+                    (unsigned)NBGData.viewId & 0xFFu, (int)layerData.CHSZ,
+                    (int)layerData.CHCN, (int)layerData.PNB, (int)layerData.CNSM,
+                    (int)layerData.PLSZ, (int)layerData.CAOS, (unsigned)layerData.SCN,
+                    (int)layerData.SPN, (int)layerData.scrollX, (int)layerData.scrollY,
+                    (unsigned)layerData.planeOffsets[0], (unsigned)layerData.planeOffsets[1],
+                    (unsigned)layerData.planeOffsets[2], (unsigned)layerData.planeOffsets[3],
+                    textureWidth, textureHeight);
+        }
+    }
+    pdMaybeDumpVram();
+
     // BGFX update texture size if needed
     if ((NBGData.m_currentWidth != textureWidth) || (NBGData.m_currentHeight != textureHeight))
     {
@@ -1554,7 +1635,7 @@ static void pdTraceLayerRegs(const char* which)
     static const bool on = getenv("PD_TRACE_LAYERS") != nullptr;
     if (!on) return;
     static u32 last = 0;
-    const u32 now = (u32)(clock() / (CLOCKS_PER_SEC / 1000));
+    const u32 now = pdNowMs();
     if (now - last < 2000) return;
     last = now;
     auto* r = vdp2Controls.m4_pendingVdp2Regs;
@@ -1589,7 +1670,7 @@ void renderBG0(u32 width, u32 height, bool bGPU)
         if (half) { textureWidth /= 2; textureHeight /= 2; }
     }
 
-    if(vdp2Controls.m4_pendingVdp2Regs->m20_BGON & 0x1)
+    if(pdLayerOn(vdp2Controls.m4_pendingVdp2Regs->m20_BGON, 0x1))
     {
         s_layerData planeData;
         planeData.CHSZ = vdp2Controls.m4_pendingVdp2Regs->m28_CHCTLA & 1;
@@ -1696,7 +1777,7 @@ void renderBG1(u32 width, u32 height, bool bGPU)
     u32 textureWidth = width;
     u32 textureHeight = height;
 
-    if (vdp2Controls.m4_pendingVdp2Regs->m20_BGON & 0x2)
+    if (pdLayerOn(vdp2Controls.m4_pendingVdp2Regs->m20_BGON, 0x2))
     {
         s_layerData planeData;
 
@@ -1787,7 +1868,7 @@ void renderBG3(u32 width, u32 height, bool bGPU)
     u32 textureWidth = width;
     u32 textureHeight = height;
 
-    if (vdp2Controls.m4_pendingVdp2Regs->m20_BGON & 0x8)
+    if (pdLayerOn(vdp2Controls.m4_pendingVdp2Regs->m20_BGON, 0x8))
     {
         s_layerData planeData;
 
@@ -1838,7 +1919,7 @@ void renderRBG0(u32 width, u32 height, bool bGPU)
     u32 textureWidth = width;
     u32 textureHeight = height;
 
-    if (vdp2Controls.m4_pendingVdp2Regs->m20_BGON & 0x10)
+    if (pdLayerOn(vdp2Controls.m4_pendingVdp2Regs->m20_BGON, 0x10))
     {
         s_layerData planeData;
 
