@@ -8,6 +8,13 @@ struct s_NBG_data
     bgfx::FrameBufferHandle BGFXFB = BGFX_INVALID_HANDLE;
     bgfx::TextureHandle BGFXTexture = BGFX_INVALID_HANDLE;
     bgfx::TextureHandle bgfx_vdp2_planeDataBuffer = BGFX_INVALID_HANDLE;
+    // Second copy of the plane descriptor, alternated every frame. The upload is
+    // 64x1 texels, but on Mali writing a texture the GPU is still reading forces
+    // a stall: measured at 11-20 ms per frame to upload 256 bytes, while the draw
+    // that consumes it costs 0.3 ms. Alternating means the upload always targets
+    // the buffer the previous frame did not use.
+    bgfx::TextureHandle bgfx_vdp2_planeDataBufferAlt = BGFX_INVALID_HANDLE;
+    unsigned planeDataParity = 0;
     bgfx::ViewId viewId = -1;
     int planeId = -1;
 

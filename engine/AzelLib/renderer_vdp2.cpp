@@ -1,4 +1,7 @@
 #include "PDS.h"
+#include <ctime>
+#include <cstdio>
+#include <cstdlib>
 #include "renderer_vdp2.h"
 #include "renderer/renderer.h"
 #include "battle/BTL_A3/BTL_A3_map6.h"
@@ -124,6 +127,13 @@ void renderLayerGPU(s_layerData& layerData, u32 textureWidth, u32 textureHeight,
     // BGFX update texture size if needed
     if ((NBGData.m_currentWidth != textureWidth) || (NBGData.m_currentHeight != textureHeight))
     {
+        // Diagnostic: a framebuffer recreated every frame explains a fixed
+        // per-draw cost that does not scale with resolution (BG0 was slow at
+        // both full and half resolution).
+        if (getenv("PD_TRACE_FRAME"))
+            fprintf(stderr, "[fb] recreate view %u: %ux%u -> %ux%u\n",
+                    (unsigned)NBGData.viewId, NBGData.m_currentWidth,
+                    NBGData.m_currentHeight, textureWidth, textureHeight);
         if (isValid(NBGData.BGFXFB))
         {
             bgfx::destroy(NBGData.BGFXFB);
@@ -147,6 +157,7 @@ void renderLayerGPU(s_layerData& layerData, u32 textureWidth, u32 textureHeight,
         NBGData.BGFXTexture = bgfx::getTexture(NBGData.BGFXFB);
 
         NBGData.bgfx_vdp2_planeDataBuffer = bgfx::createTexture2D(64, 1, 0, 0, bgfx::TextureFormat::R32U);
+        NBGData.bgfx_vdp2_planeDataBufferAlt = bgfx::createTexture2D(64, 1, 0, 0, bgfx::TextureFormat::R32U);
 
         NBGData.m_currentWidth = textureWidth;
         NBGData.m_currentHeight = textureHeight;
@@ -198,20 +209,55 @@ void renderLayerGPU(s_layerData& layerData, u32 textureWidth, u32 textureHeight,
             | BGFX_STATE_WRITE_A
         );
 
+        // Diagnostic: PD_BG0_HALF renders this layer at half resolution. If the
+        // cost follows the pixel count the shader is fill-rate bound.
+        {
+            static const bool half = getenv("PD_BG0_HALF") != nullptr;
+            if (half) { textureWidth = (textureWidth / 2) & ~1; textureHeight = (textureHeight / 2) & ~1; }
+        }
         bgfx::setViewRect(NBGData.viewId, 0, 0, textureWidth, textureHeight);
         bgfx::setViewClear(NBGData.viewId, BGFX_CLEAR_COLOR);
 
         s_layerDataGPU gpuData = packForGPU(layerData);
         fillWindowData(gpuData, wctlReg, w0eBit, w0aBit);
-        bgfx::updateTexture2D(NBGData.bgfx_vdp2_planeDataBuffer, 0, 0, 0, 0, sizeof(gpuData)/4, 1, bgfx::copy(&gpuData, sizeof(gpuData)));
+        static const bool traceLayer = getenv("PD_TRACE_FRAME") != nullptr;
+        struct timespec la, lb, lc;
+        if (traceLayer) clock_gettime(CLOCK_MONOTONIC, &la);
+        NBGData.planeDataParity ^= 1u;
+        bgfx::TextureHandle planeTex = NBGData.planeDataParity
+            ? NBGData.bgfx_vdp2_planeDataBufferAlt : NBGData.bgfx_vdp2_planeDataBuffer;
+        // Diagnostic: PD_SKIP_PLANE_UPLOAD=1 drops the 256-byte descriptor upload.
+        // If BG0's cost collapses the stall is that upload, not the shader.
+        static const bool skipPlaneUpload = getenv("PD_SKIP_PLANE_UPLOAD") != nullptr;
+        if (!skipPlaneUpload)
+            bgfx::updateTexture2D(planeTex, 0, 0, 0, 0, sizeof(gpuData)/4, 1, bgfx::copy(&gpuData, sizeof(gpuData)));
+        if (traceLayer) clock_gettime(CLOCK_MONOTONIC, &lb);
 
         bgfx::setTexture(0, texID_VDP2_RAM, bgfx_vdp2_ram_texture);
         bgfx::setTexture(1, texID_VDP2_CRAM, bgfx_vdp2_cram_texture);
-        bgfx::setTexture(2, planeDataBuffer, NBGData.bgfx_vdp2_planeDataBuffer);
+        bgfx::setTexture(2, planeDataBuffer, planeTex);
 
         bgfx::setVertexBuffer(0, quad_vertexbuffer);
         bgfx::setIndexBuffer(quad_indexbuffer);
         bgfx::submit(NBGData.viewId, bgfx_vdp2_program);
+        if (traceLayer)
+        {
+            clock_gettime(CLOCK_MONOTONIC, &lc);
+            static double sUp = 0, sDraw = 0;
+            static unsigned ln_ = 0;
+            auto ms = [](const struct timespec& x, const struct timespec& y) {
+                return (y.tv_sec - x.tv_sec) * 1000.0 + (y.tv_nsec - x.tv_nsec) / 1e6;
+            };
+            sUp += ms(la, lb);
+            sDraw += ms(lb, lc);
+            if (++ln_ % 90 == 0)
+            {
+                fprintf(stderr, "[layer] view=%u %ux%u planeUpload=%.1fms submit=%.1fms\n",
+                        (unsigned)NBGData.viewId, textureWidth, textureHeight,
+                        sUp / 90, sDraw / 90);
+                sUp = sDraw = 0;
+            }
+        }
 
     }
 
@@ -283,6 +329,7 @@ void renderLayerGPU_RBG0(s_layerDataRBG0& layerData, u32 textureWidth, u32 textu
         NBGData.BGFXTexture = bgfx::getTexture(NBGData.BGFXFB);
 
         NBGData.bgfx_vdp2_planeDataBuffer = bgfx::createTexture2D(64, 1, 0, 0, bgfx::TextureFormat::R32U);
+        NBGData.bgfx_vdp2_planeDataBufferAlt = bgfx::createTexture2D(64, 1, 0, 0, bgfx::TextureFormat::R32U);
 
         NBGData.m_currentWidth = textureWidth;
         NBGData.m_currentHeight = textureHeight;
@@ -331,7 +378,10 @@ void renderLayerGPU_RBG0(s_layerDataRBG0& layerData, u32 textureWidth, u32 textu
         }
 
         // Upload extended config (base + rotation params)
-        bgfx::updateTexture2D(NBGData.bgfx_vdp2_planeDataBuffer, 0, 0, 0, 0, sizeof(layerData) / 4, 1, bgfx::copy(&layerData, sizeof(layerData)));
+        NBGData.planeDataParity ^= 1u;
+        bgfx::TextureHandle planeTex = NBGData.planeDataParity
+            ? NBGData.bgfx_vdp2_planeDataBufferAlt : NBGData.bgfx_vdp2_planeDataBuffer;
+        bgfx::updateTexture2D(planeTex, 0, 0, 0, 0, sizeof(layerData) / 4, 1, bgfx::copy(&layerData, sizeof(layerData)));
 
         // Create and upload coefficient texture (R32I, 256-wide)
         int coeffCount = layerData.coeffCount;
@@ -366,7 +416,7 @@ void renderLayerGPU_RBG0(s_layerDataRBG0& layerData, u32 textureWidth, u32 textu
 
         bgfx::setTexture(0, texID_VDP2_RAM, bgfx_vdp2_ram_texture);
         bgfx::setTexture(1, texID_VDP2_CRAM, bgfx_vdp2_cram_texture);
-        bgfx::setTexture(2, planeDataBuffer, NBGData.bgfx_vdp2_planeDataBuffer);
+        bgfx::setTexture(2, planeDataBuffer, planeTex);
         bgfx::setTexture(3, coeffTableUniform, coeffTex);
 
         bgfx::setVertexBuffer(0, quad_vertexbuffer);
@@ -473,6 +523,7 @@ void renderLayerGPU_RBG0_dual(s_layerDataRBG0_dual& layerData, u32 textureWidth,
 
         // 47 u32s needs 64-wide texture
         NBGData.bgfx_vdp2_planeDataBuffer = bgfx::createTexture2D(64, 1, 0, 0, bgfx::TextureFormat::R32U);
+        NBGData.bgfx_vdp2_planeDataBufferAlt = bgfx::createTexture2D(64, 1, 0, 0, bgfx::TextureFormat::R32U);
 
         NBGData.m_currentWidth = textureWidth;
         NBGData.m_currentHeight = textureHeight;
@@ -521,7 +572,10 @@ void renderLayerGPU_RBG0_dual(s_layerDataRBG0_dual& layerData, u32 textureWidth,
         }
 
         // Upload extended config (plane A + plane B params)
-        bgfx::updateTexture2D(NBGData.bgfx_vdp2_planeDataBuffer, 0, 0, 0, 0, sizeof(layerData) / 4, 1, bgfx::copy(&layerData, sizeof(layerData)));
+        NBGData.planeDataParity ^= 1u;
+        bgfx::TextureHandle planeTex = NBGData.planeDataParity
+            ? NBGData.bgfx_vdp2_planeDataBufferAlt : NBGData.bgfx_vdp2_planeDataBuffer;
+        bgfx::updateTexture2D(planeTex, 0, 0, 0, 0, sizeof(layerData) / 4, 1, bgfx::copy(&layerData, sizeof(layerData)));
 
         // Create and upload coefficient texture (R32U, 256-wide)
         int coeffCount = layerData.coeffCount;
@@ -548,7 +602,7 @@ void renderLayerGPU_RBG0_dual(s_layerDataRBG0_dual& layerData, u32 textureWidth,
 
         bgfx::setTexture(0, texID_VDP2_RAM, bgfx_vdp2_ram_texture);
         bgfx::setTexture(1, texID_VDP2_CRAM, bgfx_vdp2_cram_texture);
-        bgfx::setTexture(2, planeDataBuffer, NBGData.bgfx_vdp2_planeDataBuffer);
+        bgfx::setTexture(2, planeDataBuffer, planeTex);
         bgfx::setTexture(3, coeffTableUniform, coeffTex);
 
         bgfx::setVertexBuffer(0, quad_vertexbuffer);

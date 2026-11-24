@@ -79,10 +79,27 @@ but not proven. Last updated: 2026-11-24.
   | `bgfx::frame()` | 2 ms |
   | `StartFrame`, tasks, audio | 0.0 ms |
 
-  So the cost is in VDP2 layer rendering. Not yet fixed. The working hypothesis
-  is that `renderLayerGPU` updates textures every frame while they are still
-  referenced by queued draws (~1 MB per frame across VDP1/VDP2/CRAM), which
-  forces synchronisation on Mali.
+  So the cost is in BG0's draw specifically. Established by measurement, not
+  guesswork:
+  - **BG1 and BG3 are the same size and use the same shader, and cost 0.2-0.4 ms**
+    each. So it is not generic fill rate, not the rasteriser, and not bandwidth.
+  - Skipping the 1 MB/frame VRAM upload (`PD_SKIP_VRAM_UPLOAD=1`) changes
+    nothing, so it is not texture-upload synchronisation either.
+  - Inside the layer, `bgfx::submit()` costs 0.3 ms while the 256-byte plane
+    descriptor upload shows 9-20 ms — a driver stall, and skipping it
+    (`PD_SKIP_PLANE_UPLOAD=1`) just moves the cost into the draw. The GPU is
+    saturated by BG0's own work.
+  - The plane descriptor is now double-buffered anyway (cheap, removes one known
+    stall), but it did not change the total.
+  Next step: the VDP2 shader's tile path does dozens of integer divisions and
+  modulos per pixel, all by power-of-two values that arrive as uniforms, so Mali
+  cannot fold them into shifts and emulates each one. Precomputing shift/mask
+  pairs on the CPU and using `>>`/`&` in the shader is the concrete fix; it needs
+  the embedded shaders regenerated.
+- The `PD_BG0_HALF` half-resolution A/B could not be trusted in the last runs
+  (the log was not being regenerated), so "does BG0's cost scale with pixel
+  count" is still formally unverified — it is the first thing to redo.
+
 - Disc swap. All four discs are deployed; only Disc 1 has been exercised.
 - In-game audio balance and whether the mixer restore interferes with anything
   Knulli does after the port exits.
