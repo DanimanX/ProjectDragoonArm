@@ -1924,7 +1924,16 @@ bool azelSdl_EndFrame()
                 every = e ? (unsigned)atoi(e) : 30u;
                 if (!every) every = 30;
             }
-            if (taken < 8 && ++frames % every == 0)
+            // A trigger file makes the sample land on a named screen; the frame
+            // counter alone only samples wherever the run happens to be.
+            bool trigger = false;
+            {
+                char go[512];
+                snprintf(go, sizeof(go), "%s.go", pfx);
+                if (access(go, F_OK) == 0) { remove(go); trigger = true; }
+            }
+            ++frames;
+            if (taken < 8 && (trigger || frames % every == 0))
             {
                 char path[512];
                 snprintf(path, sizeof(path), "%s%u.rgba", pfx, taken);
