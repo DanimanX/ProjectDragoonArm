@@ -1497,6 +1497,14 @@ void renderBG0(u32 width, u32 height, bool bGPU)
         textureHeight *= 2;
     }
 
+    // Diagnostic: PD_BG0_HALF=1 renders BG0 at half resolution. If its cost drops
+    // with the pixel count the bottleneck is fill rate in the tile shader;
+    // if it does not, the cost is per-draw state/synchronisation.
+    {
+        static const bool half = getenv("PD_BG0_HALF") != nullptr;
+        if (half) { textureWidth /= 2; textureHeight /= 2; }
+    }
+
     if(vdp2Controls.m4_pendingVdp2Regs->m20_BGON & 0x1)
     {
         s_layerData planeData;

@@ -23,6 +23,7 @@
 #include <bgfx/bgfx.h>
 #include <bgfx/embedded_shader.h>
 #include <unistd.h>
+#include <ctime>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -422,6 +423,16 @@ namespace
 
 	static GLuint g_scratchFbo = 0;
 	static GLuint g_defaultFbo = 0;
+
+	// glGetError() is a synchronous pipeline flush on Mali. Calling it after
+	// every texture upload and every draw serialised the GPU against the CPU and
+	// was the dominant cost of the VDP2 layers (measured: 26-63 ms/frame for
+	// three quads). Diagnostics are opt-in now.
+	static bool glDiagEnabled()
+	{
+		static const bool on = getenv("PDS_GL_DIAG") != nullptr;
+		return on;
+	}
 	static void (*g_swapHook)(void) = NULL;
 	static void (*g_preSwapHook)(void) = NULL;
 
@@ -1182,9 +1193,10 @@ namespace bgfx
 		{
 			p_glTexImage2D(GL_TEXTURE_2D, 0, (GLint)internal, _width, _height, 0, fmt, type,
 			               (_mem && _mem->data) ? _mem->data : NULL);
-			if (GLenum e = p_glGetError())
-				fprintf(stderr, "[gles]   texImage2D err 0x%x (internal 0x%x fmt 0x%x type 0x%x)\n",
-				        e, internal, fmt, type);
+			if (glDiagEnabled())
+				if (GLenum e = p_glGetError())
+					fprintf(stderr, "[gles]   texImage2D err 0x%x (internal 0x%x fmt 0x%x type 0x%x)\n",
+					        e, internal, fmt, type);
 		}
 
 		// Integer textures cannot be filtered: GL only allows NEAREST for them,
@@ -1200,9 +1212,10 @@ namespace bgfx
 		p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
 		                  (_flags & BGFX_SAMPLER_V_CLAMP) ? GL_CLAMP_TO_EDGE : GL_REPEAT);
 
-		if (GLenum err = p_glGetError())
-			fprintf(stderr, "[gles] createTexture2D(%ux%u fmt %d) gl error 0x%x\n",
-			        _width, _height, (int)_format, err);
+		if (glDiagEnabled())
+			if (GLenum err = p_glGetError())
+				fprintf(stderr, "[gles] createTexture2D(%ux%u fmt %d) gl error 0x%x\n",
+				        _width, _height, (int)_format, err);
 		if (_mem && _mem->release) _mem->release(_mem->data, _mem->userData);
 		return handle;
 	}
@@ -1228,9 +1241,10 @@ namespace bgfx
 				fprintf(stderr, "[gles]   upload handle %u gl id %u %ux%u at %u,%u src nonzero %zu\n",
 				        _handle, t.id, _width, _height, _x, _y, nz); }
 		}
-		if (GLenum e = p_glGetError())
-			fprintf(stderr, "[gles] updateTexture2D(handle %u fmt %d %ux%u at %u,%u) gl error 0x%x\n",
-			        _handle, (int)t.format, _width, _height, _x, _y, e);
+		if (glDiagEnabled())
+			if (GLenum e = p_glGetError())
+				fprintf(stderr, "[gles] updateTexture2D(handle %u fmt %d %ux%u at %u,%u) gl error 0x%x\n",
+				        _handle, (int)t.format, _width, _height, _x, _y, e);
 		{
 			// One-shot proof that the upload landed: compare source vs GPU copy.
 			static bool verified = false;
@@ -1760,8 +1774,31 @@ namespace bgfx
 			p_glDrawElements(mode, count, GL_UNSIGNED_SHORT,
 			                 (const void*)(uintptr_t)(g_ibFirst * sizeof(uint16_t)));
 			p_glBindVertexArray(0);
-			if (GLenum e = p_glGetError())
-				fprintf(stderr, "[gles]   drawElements(%d) gl error 0x%x (prog %u)\n", count, e, _program);
+			if (glDiagEnabled())
+				if (GLenum e = p_glGetError())
+					fprintf(stderr, "[gles]   drawElements(%d) gl error 0x%x (prog %u)\n", count, e, _program);
+		}
+
+		{
+			// Diagnostic: draws per view, to catch a layer that renders far more
+			// often than the one quad it is supposed to.
+			static const bool traceDraws = getenv("PD_TRACE_DRAWS") != nullptr;
+			if (traceDraws)
+			{
+				static unsigned perView[256] = {0};
+				static unsigned lastTick = 0;
+				perView[_id & 0xFF]++;
+				const unsigned now = (unsigned)(clock() / (CLOCKS_PER_SEC / 1000));
+				if (now - lastTick >= 1000)
+				{
+					lastTick = now;
+					fprintf(stderr, "[draws]");
+					for (int i = 0; i < 32; ++i)
+						if (perView[i]) fprintf(stderr, " v%d=%u", i, perView[i]);
+					fprintf(stderr, "\n");
+					memset(perView, 0, sizeof(perView));
+				}
+			}
 		}
 
 		g_pendingTextures.clear();

@@ -1550,9 +1550,16 @@ bool azelSdl_EndFrame()
     }
 
     {
-        bgfx::updateTexture2D(bgfx_vdp1_ram_texture, 0, 0, 0, 0, 256, 0x80000 / 256, bgfx::makeRef(getVdp1Pointer(0x25C00000), 0x80000));
-        bgfx::updateTexture2D(bgfx_vdp2_ram_texture, 0, 0, 0, 0, 256, 0x80000 / 256, bgfx::makeRef(getVdp2Vram(0), 0x80000));
-        bgfx::updateTexture2D(bgfx_vdp2_cram_texture, 0, 0, 0, 0, 256, 0x1000 / 256, bgfx::makeRef(getVdp2Cram(0), 0x1000));
+        // Diagnostic switch: PD_SKIP_VRAM_UPLOAD=1 skips the 1 MB/frame upload,
+        // to tell a slow shader apart from the cost of re-uploading textures the
+        // GPU is still reading (Mali has to synchronise on the first draw).
+        static const bool skipUpload = getenv("PD_SKIP_VRAM_UPLOAD") != nullptr;
+        if (!skipUpload)
+        {
+            bgfx::updateTexture2D(bgfx_vdp1_ram_texture, 0, 0, 0, 0, 256, 0x80000 / 256, bgfx::makeRef(getVdp1Pointer(0x25C00000), 0x80000));
+            bgfx::updateTexture2D(bgfx_vdp2_ram_texture, 0, 0, 0, 0, 256, 0x80000 / 256, bgfx::makeRef(getVdp2Vram(0), 0x80000));
+            bgfx::updateTexture2D(bgfx_vdp2_cram_texture, 0, 0, 0, 0, 256, 0x1000 / 256, bgfx::makeRef(getVdp2Cram(0), 0x1000));
+        }
     }
 
     static bool BG0_GPU = true;
