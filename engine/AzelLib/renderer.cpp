@@ -41,6 +41,8 @@ SoLoud::Soloud gSoloud; // Engine core
 
 int outputResolution[2] = { 1024, 814 };
 int internalResolution[2] = { 352, 224 };
+int vdp1Resolution[2] = { 352, 224 };
+u64 g_vdp2ContentGen = 1;
 
 bgfx::FrameBufferHandle gBGFXVdp1PolyFB = BGFX_INVALID_HANDLE;
 bgfx::TextureHandle vdp1BufferTexture = BGFX_INVALID_HANDLE;
@@ -301,11 +303,28 @@ void azelSdl_StartFrame()
             | BGFX_SAMPLER_V_CLAMP
             ;
 
+        // Scale VDP1 separately from the composite resolution so Mali-G31 does
+        // not shade 720x540 (~5x Saturn) of heavy inverse-bilinear 3D polygons.
+        // Defaults to 0.5 (360x270, still above native 352x224) on ARM64.
+        float vdp1Scale =
+#if defined(__aarch64__)
+            0.5f;
+#else
+            1.0f;
+#endif
+        if (const char* s = getenv("PD_VDP1_SCALE"))
+        {
+            float v = (float)atof(s);
+            if (v >= 0.25f && v <= 2.0f) vdp1Scale = v;
+        }
+        vdp1Resolution[0] = std::max(1, (int)(internalResolution[0] * vdp1Scale + 0.5f));
+        vdp1Resolution[1] = std::max(1, (int)(internalResolution[1] * vdp1Scale + 0.5f));
+
         // vdp1PriorityTexture was only used by the dead renderVdp1WithPriority
         // path; VDP2_composite_ps decodes priority from vdp1BufferTexture.a.
-        // Keeping only color + depth avoids an unused 720x540 MRT attachment.
-        vdp1BufferTexture = bgfx::createTexture2D(internalResolution[0], internalResolution[1], false, 0, bgfx::TextureFormat::BGRA8, BGFX_TEXTURE_RT | tsFlags);
-        vdp1DepthBufferTexture = bgfx::createTexture2D(internalResolution[0], internalResolution[1], false, 0, bgfx::TextureFormat::D24S8, BGFX_TEXTURE_RT | tsFlags);
+        // Keeping only color + depth avoids an unused MRT attachment.
+        vdp1BufferTexture = bgfx::createTexture2D(vdp1Resolution[0], vdp1Resolution[1], false, 0, bgfx::TextureFormat::BGRA8, BGFX_TEXTURE_RT | tsFlags);
+        vdp1DepthBufferTexture = bgfx::createTexture2D(vdp1Resolution[0], vdp1Resolution[1], false, 0, bgfx::TextureFormat::D24S8, BGFX_TEXTURE_RT | tsFlags);
         std::array<bgfx::Attachment, 2> vdp1BufferAt;
         vdp1BufferAt[0].init(vdp1BufferTexture);
         vdp1BufferAt[1].init(vdp1DepthBufferTexture);
@@ -590,7 +609,10 @@ void azelSdl_StartFrame()
         if (ev & 0xFFFFu)
         {
             setButtons((u16)(ev & 0xFFFFu));
-            useGamepad = true;
+            // Report Saturn digital controller (m0_inputType = 1) for the
+            // handheld D-pad; analog mode (2) ignores digital D-pad movement
+            // in 3D towns/fields and waits for analogX/analogY.
+            useGamepad = false;
         }
     }
 
@@ -1663,15 +1685,34 @@ bool azelSdl_EndFrame()
             static std::vector<u8> lastVdp2Cram;
             const u8* curVdp2Ram = getVdp2Vram(0);
             const u8* curVdp2Cram = getVdp2Cram(0);
-            if (lastVdp2Ram.size() != 0x80000 || memcmp(lastVdp2Ram.data(), curVdp2Ram, 0x80000) != 0)
+            if (lastVdp2Ram.size() != 0x80000)
             {
                 lastVdp2Ram.assign(curVdp2Ram, curVdp2Ram + 0x80000);
                 bgfx::updateTexture2D(bgfx_vdp2_ram_texture, 0, 0, 0, 0, 256, 0x80000 / 256, bgfx::makeRef(curVdp2Ram, 0x80000));
+                ++g_vdp2ContentGen;
+            }
+            else if (memcmp(lastVdp2Ram.data(), curVdp2Ram, 0x80000) != 0)
+            {
+                // Upload only the dirty row span [minRow..maxRow] instead of
+                // the full 512 KB every frame (cuts movie & subtitle upload cost).
+                constexpr int kRows = 0x80000 / 256;
+                int minRow = 0;
+                while (minRow < kRows && memcmp(lastVdp2Ram.data() + minRow * 256, curVdp2Ram + minRow * 256, 256) == 0)
+                    ++minRow;
+                int maxRow = kRows - 1;
+                while (maxRow > minRow && memcmp(lastVdp2Ram.data() + maxRow * 256, curVdp2Ram + maxRow * 256, 256) == 0)
+                    --maxRow;
+                const int span = maxRow - minRow + 1;
+                memcpy(lastVdp2Ram.data() + minRow * 256, curVdp2Ram + minRow * 256, (size_t)span * 256);
+                bgfx::updateTexture2D(bgfx_vdp2_ram_texture, 0, 0, 0, (uint16_t)minRow, 256, (uint16_t)span,
+                                      bgfx::makeRef(curVdp2Ram + minRow * 256, (uint32_t)(span * 256)));
+                ++g_vdp2ContentGen;
             }
             if (lastVdp2Cram.size() != 0x1000 || memcmp(lastVdp2Cram.data(), curVdp2Cram, 0x1000) != 0)
             {
                 lastVdp2Cram.assign(curVdp2Cram, curVdp2Cram + 0x1000);
                 bgfx::updateTexture2D(bgfx_vdp2_cram_texture, 0, 0, 0, 0, 256, 0x1000 / 256, bgfx::makeRef(curVdp2Cram, 0x1000));
+                ++g_vdp2ContentGen;
             }
         }
     }
@@ -1878,13 +1919,13 @@ bool azelSdl_EndFrame()
     {
         bgfx::setViewName(vdp1_gpuView, "Vdp1");
         bgfx::setViewFrameBuffer(vdp1_gpuView, gBGFXVdp1PolyFB);
-        bgfx::setViewRect(vdp1_gpuView, 0, 0, internalResolution[0], internalResolution[1]);
+        bgfx::setViewRect(vdp1_gpuView, 0, 0, vdp1Resolution[0], vdp1Resolution[1]);
 
         bgfx::setViewClear(vdp1_gpuView, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH, 0);
         bgfx::touch(vdp1_gpuView);
 
-        float scaleX = internalResolution[0] / 352.f;
-        float scaleY = internalResolution[1] / 224.f;
+        float scaleX = vdp1Resolution[0] / 352.f;
+        float scaleY = vdp1Resolution[1] / 224.f;
         bgfx::setViewScissor(vdp1_gpuView, cameraProperties.x0* scaleX, cameraProperties.y0* scaleY, cameraProperties.x1* scaleX - cameraProperties.x0 * scaleX, cameraProperties.y1* scaleY - cameraProperties.y0 * scaleY);
 
         bgfx::setViewMode(vdp1_gpuView, bgfx::ViewMode::Sequential);
@@ -1899,7 +1940,7 @@ bool azelSdl_EndFrame()
         {
             if (traceRender && syncPasses) { pd_gpu_sync(); clock_gettime(CLOCK_MONOTONIC, &rb); }
     else if (traceRender) clock_gettime(CLOCK_MONOTONIC, &rb);
-            renderVdp1ToGL(internalResolution[0], internalResolution[1]);
+            renderVdp1ToGL(vdp1Resolution[0], vdp1Resolution[1]);
             if (traceRender && syncPasses) { pd_gpu_sync(); clock_gettime(CLOCK_MONOTONIC, &rc); }
             else if (traceRender) clock_gettime(CLOCK_MONOTONIC, &rc);
         }

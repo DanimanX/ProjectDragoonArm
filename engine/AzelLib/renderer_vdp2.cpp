@@ -206,8 +206,14 @@ void renderLayerGPU(s_layerData& layerData, u32 textureWidth, u32 textureHeight,
     pdMaybeDumpVram();
 
     // BGFX update texture size if needed
+    extern u64 g_vdp2ContentGen;
+    struct LastLayerState { u64 gen; u32 w, h; s_layerDataGPU data; bool valid; };
+    static LastLayerState s_lastLayer[8] = {};
+    const u32 slot = (NBGData.planeId < 8) ? NBGData.planeId : 0;
+
     if ((NBGData.m_currentWidth != textureWidth) || (NBGData.m_currentHeight != textureHeight))
     {
+        s_lastLayer[slot].valid = false;
         // Diagnostic: a framebuffer recreated every frame explains a fixed
         // per-draw cost that does not scale with resolution (BG0 was slow at
         // both full and half resolution).
@@ -304,6 +310,23 @@ void renderLayerGPU(s_layerData& layerData, u32 textureWidth, u32 textureHeight,
         if (traceLayer) clock_gettime(CLOCK_MONOTONIC, &lp);
         s_layerDataGPU gpuData = packForGPU(layerData);
         fillWindowData(gpuData, wctlReg, w0eBit, w0aBit);
+        // Skip re-rendering a VDP2 layer when VRAM, CRAM, layer config, and
+        // size are all identical to what is already in NBGData.BGFXTexture.
+        // Cuts ~30 ms/frame of redundant Mali-G31 bandwidth on static layers.
+        if (s_lastLayer[slot].valid &&
+            s_lastLayer[slot].gen == g_vdp2ContentGen &&
+            s_lastLayer[slot].w == textureWidth &&
+            s_lastLayer[slot].h == textureHeight &&
+            memcmp(&s_lastLayer[slot].data, &gpuData, sizeof(gpuData)) == 0)
+        {
+            return;
+        }
+        s_lastLayer[slot].gen = g_vdp2ContentGen;
+        s_lastLayer[slot].w = textureWidth;
+        s_lastLayer[slot].h = textureHeight;
+        s_lastLayer[slot].data = gpuData;
+        s_lastLayer[slot].valid = true;
+
         if (traceLayer) clock_gettime(CLOCK_MONOTONIC, &la);
         NBGData.planeDataParity ^= 1u;
         bgfx::TextureHandle planeTex = NBGData.planeDataParity
@@ -1682,37 +1705,12 @@ void renderBG0(u32 width, u32 height, bool bGPU)
 
         if (isBitmapMode)
         {
-            // Bitmap mode: VRAM base, no tile indirection.
-            //
-            // MPOFN alone is not enough here. It addresses VRAM in 128 KB banks,
-            // and the movie layer decodes its frames to a buffer that is not on a
-            // bank boundary: for 320x176 the destination is 0x25E14040, i.e.
-            // offset 0x14040, which MPOFN cannot express (0x14040 >> 17 == 0).
-            // Reading from MPOFN's bank 0 therefore returned the font graphics
-            // that unpackGraphicsToVDP2 writes at VRAM offset 0 — which is why
-            // the movie showed text glyphs drawn as graphics.
-            //
-            // Verified by dumping VDP2 VRAM mid-movie: decoding it as a 320x176
-            // XRGB bitmap at 0x14040 (stride 2048) yields a coherent frame,
-            // while decoding at 0 yields the font data.
+            // Bitmap mode: VRAM base comes from MPOFN (128 KB bank). For CPK
+            // movies, the decoder writes 320x176 centered in a 512x256 bitmap
+            // at 0x14040 (row 40, col 16) with SCYN0=16 and Window 0 set to
+            // x=16..335, y=24..199, so pixel (16,24) samples outputY=40 ->
+            // 0x14040 and Window 0 cleanly clips the margins to black.
             u32 mapOffset = (vdp2Controls.m4_pendingVdp2Regs->m3C_MPOFN & 7) << 17;
-            // Remember where the movie decoder put its frames. The layer stays in
-            // this 16.7M-colour bitmap mode after the movie closes (measured:
-            // CHCTLA stays 0x0044 while the handle is already null), and the
-            // frames are still in VRAM there. Falling back to MPOFN then reads
-            // bank 0 — the font — which is the garbled/black screen right after
-            // the intro. Keeping the last movie base shows the frame that is
-            // actually in memory.
-            static u32 s_lastMovieBase = 0;
-            if (fileInfoStruct.mC_gfsHandle != nullptr)
-            {
-                s_lastMovieBase = fileInfoStruct.m1C_vramDest - 0x25E00000u;
-                mapOffset = s_lastMovieBase;
-            }
-            else if (planeData.CHCN == 4 && s_lastMovieBase != 0)
-            {
-                mapOffset = s_lastMovieBase;
-            }
             planeData.planeOffsets[0] = mapOffset;
             if (getenv("PD_TRACE_LAYERS"))
                 fprintf(stderr, "[bitmap] NBG0 base=0x%05x CHCN=%d movie=%d\n",

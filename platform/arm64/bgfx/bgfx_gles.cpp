@@ -2279,7 +2279,7 @@ static void prepareView(bgfx::ViewId id)
 				fprintf(stderr, "[port] picture fit: content %.0fx%.0f in %dx%d -> scale %.3fx%.3f offset %.0f,%.0f\n",
 				        cw, ch, g_width, g_height, sx, sy, ox, oy);
 		}
-		if (fit && v.w == g_width && v.h >= g_height && sx > 0)
+		if (fit && target == g_defaultFbo && v.w == g_width && v.h >= g_height && sx > 0)
 		{
 			const float frameH = (float)g_width * 0.75f;
 			p_glViewport((int)(v.x + ox), (int)(v.y + oy),
