@@ -3892,14 +3892,28 @@ void fieldDebugMenuUpdate2()
 
 bool initField(p_workArea workArea, const s_MCB_CGB* fieldFileList, u32 arg)
 {
+    // Port diagnostic: field bring-up is where a black field is decided. This
+    // logs entry, the 3D setup (which fixes the VDP1 clip) and both memory
+    // budgets, whose negative values make initField bail out silently.
+    if (getenv("PD_TRACE_FIELD"))
+        fprintf(stderr, "[field] initField enter\n");
     reset3dEngine();
+    if (getenv("PD_TRACE_FIELD"))
+        fprintf(stderr, "[field] reset3dEngine done, camera clip=(%d,%d)-(%d,%d)\n",
+                cameraProperties.x0, cameraProperties.y0,
+                cameraProperties.x1, cameraProperties.y1);
 
     loadCommonFieldResources();
 
     setupFileList(fieldFileList);
 
+    if (getenv("PD_TRACE_FIELD"))
+        fprintf(stderr, "[field] memoryAreaRemain=%d characterAreaRemain=%d\n",
+                (int)getFieldMemoryAreaRemain(), (int)getFieldCharacterAreaRemain());
     if (getFieldMemoryAreaRemain() < 0)
     {
+        if (getenv("PD_TRACE_FIELD"))
+            fprintf(stderr, "[field] BAIL: field memory area exhausted\n");
         return false;
     }
 

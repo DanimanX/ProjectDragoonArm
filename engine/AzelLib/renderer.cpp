@@ -638,6 +638,31 @@ void azelSdl_StartFrame()
     // (0x0008 = Start); it pulses every PD_FAKE_PERIOD_MS for PD_FAKE_HOLD_MS
     // starting at PD_FAKE_AT_MS, which is enough to walk the title menu.
     {
+        // PD_FAKE_SEQ="1200:8,9000:1,14000:1" scripts a press sequence:
+        // <at_ms>:<hex mask> pairs, each held 250 ms. The single-mask hook above
+        // could only repeat one button, which walked into the save menu instead
+        // of into the field and made earlier field measurements meaningless.
+        static const char* fakeSeqEnv = getenv("PD_FAKE_SEQ");
+        if (fakeSeqEnv)
+        {
+            static u32 seqStart = 0;
+            if (!seqStart) seqStart = SDL_GetTicks();
+            const u32 elapsed = SDL_GetTicks() - seqStart;
+            const char* q = fakeSeqEnv;
+            while (*q)
+            {
+                const u32 atMs = (u32)strtoul(q, (char**)&q, 10);
+                if (*q != ':') break;
+                const u32 mask = (u32)strtoul(q + 1, (char**)&q, 16);
+                if (*q == ',') ++q;
+                if (elapsed >= atMs && elapsed < atMs + 250)
+                {
+                    setButtons((u16)mask);
+                    useGamepad = true;
+                }
+            }
+        }
+
         static const char* fakeMaskEnv = getenv("PD_FAKE_MASK");
         if (fakeMaskEnv)
         {

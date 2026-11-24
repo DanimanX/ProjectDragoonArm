@@ -16,6 +16,7 @@ but not proven. Last updated: 2026-11-24.
 | Input on the handheld | SDL enumerates the pad but delivers no `SDL_EVENT_GAMEPAD_*` and `SDL_GetGamepadButton()` returns 0 forever inside the game process, while `/dev/input/event1` reads correctly. The port now polls evdev itself (`pd_evdev_pad_mask`), verified end to end: A=0x0001, B=0x0002, C=0x0004, X=0x0800, L1=0x8000, R1=0x1000 |
 | EmulationStation overlay | ES holds `/dev/fb0` open; the launcher now stops ES for the session and restores the exact frame it was showing before resuming it. Verified: clean game picture while playing (ES in state T), ES menu identical after exit (8,105 colours, same as before), ES back to state S |
 | Movie-end crash | `closeMovieStream()` stopped a SoLoud voice from the main thread while the mixer thread was already reaping it (`hasEnded()` had flipped), a double free inside `stopVoice_internal`. The voice is now owned solely by SoLoud's audio thread; the handle is just dropped. Verified: `crash=0` and the movie state machine ran to completion (`state 3→4→5→6`) |
+| CPK movies rendered as glyphs | the bitmap layer took its base from `MPOFN`, which addresses VRAM in 128 KB banks and yields 0 here, while the decoder writes frames at 0x25E14040 (computed from the video size). `MPOFN` cannot express that, so the layer read VRAM offset 0 — where `unpackGraphicsToVDP2` puts the font — and drew glyphs as graphics. Proven by dumping VDP2 VRAM mid-movie and decoding it as a 320x176 XRGB bitmap (stride 2048): coherent frame at 0x14040, font data at 0. After the fix, device captures of attract mode show real frames (a dragon, a rider) |
 | Menu exit | the overlay wrote `bContinue = false`, but the hook runs inside `azelSdl_EndFrame()` and `loopIteration()` assigns `bContinue = azelSdl_EndFrame()` right after, discarding it. The menu now sets `closeApp`, which `EndFrame` derives its return from. Confirmed on the device |
 | Adaptive vblank | `FBIO_WAITFORVSYNC` can block far longer than one refresh once the panel stops paging (measured: ~1 fps with the process idle, load 1.6/4 cores). The wait is now timed and disables itself past 50 ms; frame rate returns to ~30 fps |
 | Renderer geometry | the engine sizes itself from `SDL_GetWindowSize()`; asking the `offscreen` driver for a fullscreen window made it adopt 1024x768, so a 720x480 panel showed an off-centre, cropped picture. Backbuffer is now 720x480 and the composite view is 720x540 as upstream computes it |
@@ -52,9 +53,12 @@ but not proven. Last updated: 2026-11-24.
 
 ## Pending
 
-- **The field does not render yet.** This is the one that matters. Measured on
-  the device, reaching the field after "New Game" leaves a black or garbled
-  screen:
+- **The field does not render yet.** This is the one that matters. Note that
+  earlier field measurements were partly invalid: `PD_FAKE_MASK` could only
+  repeat one button, so it navigated into the *save menu* (visible in the task
+  traces as `LoadSavegameScreen`, `saveMenuSubTask0`) rather than into the field.
+  `PD_FAKE_SEQ` now scripts a press sequence for reproducible navigation.
+  Recorded observations, still to be re-taken on a real playthrough:
   - The engine does advance: it creates the field tasks (`BattleManager`,
     `fieldDebugTaskWorkArea`), VDP1 command count grows from 4 to 23, and the
     movie state machine completes.
