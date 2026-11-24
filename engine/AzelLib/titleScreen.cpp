@@ -24,8 +24,13 @@ s_titleMenuEntry mainMenuDebug[] = {
 
 bool hasSaveGame()
 {
+    // Returning true (the upstream stub) made CONTINUE the default selection on
+    // every boot, so the first Start press opened the save menu instead of
+    // starting the game, and that menu is what the black screen after Start
+    // was. There is no save storage in this port yet, so report none and let
+    // the menu default to NEW GAME.
     PDS_unimplemented("hasSaveGame");
-    return true;
+    return false;
 }
 
 struct s_titleMenuWorkArea : public s_workAreaTemplate<s_titleMenuWorkArea>
