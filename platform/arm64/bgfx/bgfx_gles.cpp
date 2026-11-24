@@ -993,6 +993,49 @@ namespace bgfx
 			body += src[i++];
 		}
 
+		// ------------------------------------------------------------------
+		// Mali fixes for the VDP2 tile shader.
+		//
+		// Both were found by comparing our decompiled ESSL against the Lagi port's
+		// independent VDP2 implementation (Lagi/shaders/vdp2_nbg_f.cg), which
+		// documents the first one as the cause of "cyan/teal title corruption" —
+		// exactly the garbage this port showed on tiled layers:
+		//
+		//  1. characterOffset must be characterNumber * 32. A Saturn character
+		//     number is in 32-byte units; without the scale every pattern is read
+		//     32x too low in VRAM.
+		//  2. In 256-colour mode (CHCN==1) the 8-bit dot is already the palette
+		//     index. Applying the 4bpp pattern palette number selects unrelated
+		//     CRAM banks.
+		//
+		// pdPatch is loud on purpose: if the embedded shader text ever changes
+		// shape, a silent no-op here would quietly reintroduce the bug.
+		auto pdPatch = [&](std::string& body, const std::string& from,
+		                   const std::string& to, const char* what) -> void {
+			const size_t at = body.find(from);
+			if (at == std::string::npos)
+			{
+				fprintf(stderr, "[gles] WARNING: shader patch '%s' did not apply\n", what);
+				return;
+			}
+			body.replace(at, from.size(), to);
+			fprintf(stderr, "[gles] shader patch applied: %s\n", what);
+		};
+		if (strstr(label, "VDP2_ps") != nullptr)
+		{
+			pdPatch(body,
+			        "characterOffset_54 = characterNumber_56;",
+			        "characterOffset_54 = (characterNumber_56 * 32);",
+			        "character offset is 32-byte units");
+			pdPatch(body,
+			        "          paletteOffset_52 = (((\n"
+			        "            (paletteNumber_55 << 4)\n"
+			        "           + dotColor_53) * 2) + (texelValue_10 * 512));",
+			        "          paletteOffset_52 = ((texelValue_4 == 1) ? (dotColor_53 * 2)"
+			        " : ((((paletteNumber_55 << 4) + dotColor_53) * 2) + (texelValue_10 * 512)));",
+			        "256-colour palette index");
+		}
+
 		std::string full = "#version 300 es\n";
 		full += "precision highp int;\n"
 		        "precision highp float;\n"

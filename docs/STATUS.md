@@ -70,10 +70,22 @@ but not proven. Last updated: 2026-11-24.
   - Writer and reader agree on addressing: `setVdp2MapOffset` for NBG3 computes
     A=0x6000 with shift=13 and the reader derives 0x6000; for NBG0 both derive
     0x10000. So the plane-offset maths is not the bug.
-  - But VRAM at 0x10000 is **entirely zero**, while offset 0 x00000-0x00800 is
-    76% non-zero. So the layer is being pointed at a region the game never
-    filled, which points at the register state being stale or at the map being
-    written through a path `setVdp2MapOffset` does not cover.
+  - VRAM at 0x10000 is **entirely zero** while 0x00000..0x00800 is 76%
+    non-zero, i.e. the layer reads a region the game never filled.
+  - The cause turned out to be in the shader, found by comparing our decompiled
+    ESSL with Lagi's independent VDP2 implementation
+    (`Lagi/shaders/vdp2_nbg_f.cg`). Two defects, both of which Lagi documents as
+    producing *cyan/teal corruption* — the exact colour of this port's garbage:
+    1. `characterOffset = characterNumber` with no `* 32`. A Saturn character
+       number is in 32-byte units, so every pattern was read 32x too low.
+    2. 256-colour mode applied the 4bpp pattern palette number
+       (`(paletteNumber << 4) + dotColor`). In CHCN=1 the 8-bit dot is already
+       the palette index; the shift selects unrelated CRAM banks.
+    Both are corrected in `compileStage` in `platform/arm64/bgfx/bgfx_gles.cpp`,
+    loudly (a pattern that stops matching prints a warning rather than silently
+    doing nothing). Verified that the patched shader still compiles and links
+    (host build: `program VDP2_vs/VDP2_ps -> handle 10240`), but **not yet
+    verified on the panel**.
 
   Recorded observations, still to be re-taken on a real playthrough:
   - The engine does advance: it creates the field tasks (`BattleManager`,
