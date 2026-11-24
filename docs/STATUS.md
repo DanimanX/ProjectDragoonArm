@@ -58,6 +58,23 @@ but not proven. Last updated: 2026-11-24.
   repeat one button, so it navigated into the *save menu* (visible in the task
   traces as `LoadSavegameScreen`, `saveMenuSubTask0`) rather than into the field.
   `PD_FAKE_SEQ` now scripts a press sequence for reproducible navigation.
+  Current state of that investigation, all measured with `PD_TRACE_LAYERS`:
+
+  - The movie case is fixed (see the CPK row above). But the layer *stays* in
+    that 16.7M bitmap mode after the movie closes (`CHCTLA=0x0044` with the
+    handle already null), so the base fell back to `MPOFN`'s bank 0 — the font.
+    The last movie base is now remembered and reused while `CHCN==4`.
+  - The save/load menu renders garbage tiles. Its state is `BGON=0x000b`,
+    `CHCTLA=0x0011` (tile mode, 256 colours, 16x16 chars), `PNCN0=0xc000`,
+    `MPABN0=0x2120`, `PLSZ=0x0000`.
+  - Writer and reader agree on addressing: `setVdp2MapOffset` for NBG3 computes
+    A=0x6000 with shift=13 and the reader derives 0x6000; for NBG0 both derive
+    0x10000. So the plane-offset maths is not the bug.
+  - But VRAM at 0x10000 is **entirely zero**, while offset 0 x00000-0x00800 is
+    76% non-zero. So the layer is being pointed at a region the game never
+    filled, which points at the register state being stale or at the map being
+    written through a path `setVdp2MapOffset` does not cover.
+
   Recorded observations, still to be re-taken on a real playthrough:
   - The engine does advance: it creates the field tasks (`BattleManager`,
     `fieldDebugTaskWorkArea`), VDP1 command count grows from 4 to 23, and the

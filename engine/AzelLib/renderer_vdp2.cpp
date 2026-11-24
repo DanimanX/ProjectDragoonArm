@@ -1546,8 +1546,32 @@ void renderLayer(s_layerData& layerData, u32 textureWidth, u32 textureHeight, u3
 // Public renderBG/RBG functions
 //----------------------------------------------------------------------
 
+// Port diagnostic: dump every addressing input for the NBG layers, so a layer
+// that reads the wrong VRAM is visible as numbers rather than as garbage on the
+// panel. PD_TRACE_LAYERS=1.
+static void pdTraceLayerRegs(const char* which)
+{
+    static const bool on = getenv("PD_TRACE_LAYERS") != nullptr;
+    if (!on) return;
+    static u32 last = 0;
+    const u32 now = (u32)(clock() / (CLOCKS_PER_SEC / 1000));
+    if (now - last < 2000) return;
+    last = now;
+    auto* r = vdp2Controls.m4_pendingVdp2Regs;
+    fprintf(stderr,
+            "[regs] %s BGON=0x%04x MPOFN=0x%04x MPABN0=0x%04x MPCDN0=0x%04x "
+            "MPABN3=0x%04x MPCDN3=0x%04x CHCTLA=0x%04x CHCTLB=0x%04x "
+            "PNCN0=0x%04x PNCN3=0x%04x PLSZ=0x%04x\n",
+            which, (unsigned)r->m20_BGON, (unsigned)r->m3C_MPOFN,
+            (unsigned)r->m40_MPABN0, (unsigned)r->m42_MPCDN0,
+            (unsigned)r->m4C_MPABN3, (unsigned)r->m4E_MPCDN3,
+            (unsigned)r->m28_CHCTLA, (unsigned)r->m2A_CHCTLB,
+            (unsigned)r->m30_PNCN0, (unsigned)r->m36_PNCN3, (unsigned)r->m3A_PLSZ);
+}
+
 void renderBG0(u32 width, u32 height, bool bGPU)
 {
+    pdTraceLayerRegs("BG0");
     u32 textureWidth = width;
     u32 textureHeight = height;
 
@@ -1591,9 +1615,28 @@ void renderBG0(u32 width, u32 height, bool bGPU)
             // XRGB bitmap at 0x14040 (stride 2048) yields a coherent frame,
             // while decoding at 0 yields the font data.
             u32 mapOffset = (vdp2Controls.m4_pendingVdp2Regs->m3C_MPOFN & 7) << 17;
+            // Remember where the movie decoder put its frames. The layer stays in
+            // this 16.7M-colour bitmap mode after the movie closes (measured:
+            // CHCTLA stays 0x0044 while the handle is already null), and the
+            // frames are still in VRAM there. Falling back to MPOFN then reads
+            // bank 0 — the font — which is the garbled/black screen right after
+            // the intro. Keeping the last movie base shows the frame that is
+            // actually in memory.
+            static u32 s_lastMovieBase = 0;
             if (fileInfoStruct.mC_gfsHandle != nullptr)
-                mapOffset = fileInfoStruct.m1C_vramDest - 0x25E00000u;
+            {
+                s_lastMovieBase = fileInfoStruct.m1C_vramDest - 0x25E00000u;
+                mapOffset = s_lastMovieBase;
+            }
+            else if (planeData.CHCN == 4 && s_lastMovieBase != 0)
+            {
+                mapOffset = s_lastMovieBase;
+            }
             planeData.planeOffsets[0] = mapOffset;
+            if (getenv("PD_TRACE_LAYERS"))
+                fprintf(stderr, "[bitmap] NBG0 base=0x%05x CHCN=%d movie=%d\n",
+                        (unsigned)mapOffset, planeData.CHCN,
+                        fileInfoStruct.mC_gfsHandle != nullptr);
             planeData.planeOffsets[1] = 0;
             planeData.planeOffsets[2] = 0;
             planeData.planeOffsets[3] = 0;

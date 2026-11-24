@@ -1,4 +1,7 @@
 #include "PDS.h"
+#include <ctime>
+#include <cstdio>
+#include <cstdlib>
 #include "3dEngine_textureCache.h"
 
 u8 vdp2Ram[0x80000];
@@ -916,6 +919,36 @@ void initLayerMap(u32 layer, u32 planeA, u32 planeB, u32 planeC, u32 planeD)
     u32 planeDOffset = planeD;// - 0x25E00000;
 
     u32 mapOffset = (rotateRightR0ByR1(planeAOffset, shiftValue + 6)) & 7;
+
+    // Port diagnostic: the writer side of the map offsets. Pairing this with the
+    // read side (renderer_vdp2.cpp) is how a layer that reads the wrong VRAM is
+    // caught as numbers instead of as garbage on the panel.
+    if (getenv("PD_TRACE_LAYERS"))
+    {
+        // Keep the latest write per layer and print all four once a second: a
+        // single global throttle hid every layer except the last one, which made
+        // it look as if NBG0's map offset was never written at all.
+        static u32 lA[4] = {0}, lShift[4] = {0};
+        static bool seen[4] = {false, false, false, false};
+        static u32 lastW = 0;
+        if (layer >= 0 && layer < 4)
+        {
+            lA[layer] = planeAOffset;
+            lShift[layer] = shiftValue;
+            seen[layer] = true;
+        }
+        const u32 nowW = (u32)(clock() / (CLOCKS_PER_SEC / 1000));
+        if (nowW - lastW >= 1000)
+        {
+            lastW = nowW;
+            fprintf(stderr, "[mapwrite]");
+            for (int i = 0; i < 4; ++i)
+                if (seen[i])
+                    fprintf(stderr, " L%d A=0x%05x shift=%u", i, (unsigned)lA[i],
+                            (unsigned)lShift[i]);
+            fprintf(stderr, "\n");
+        }
+    }
 
     switch (layer)
     {
