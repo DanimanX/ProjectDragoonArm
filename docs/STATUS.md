@@ -54,6 +54,26 @@ but not proven. Last updated: 2026-11-24.
 
 ## Pending
 
+- **A VDP1 pass covers the VDP2 picture.** This is now the single visual
+  blocker, and it is why "the game is black" kept coming back after each
+  rendering fix. Measured on the device with the name-entry screen:
+
+  - With the VDP1 pass enabled the panel is solid black. With `PD_NO_VDP1=1`
+    the same frame renders correctly (letter grid, Back/Space/Enter buttons,
+    field task state 4, 33 live tasks).
+  - VDP1 issues only 6 commands in that frame (2 scaled sprites, user clip,
+    system clip, 2 local-coordinate commands), `clip=(0,0)-(352,224)`, so it
+    is not a volume problem: something in how its output is composited over
+    VDP2 is wrong.
+  - `VDP2_composite_ps.sc` decides with `vdp1Priority = floor(a*8-0.5)` and
+    gates on `vdp1Color.a > 0.1`; a sprite at priority 0 outranks every VDP2
+    layer at priority 0, so one full-panel sprite is enough to black out a
+    whole scene. The next step is to read back the VDP1 colour/priority
+    targets for that frame and check the alpha a cleared pixel actually has,
+    and what those two sprites cover.
+  - `PD_TRACE_VDP1=1` now dumps the command walk in draw order for frames with
+    8 or more commands, which is how the offending sprite gets named.
+
 - **The field does not render yet.** This is the one that matters. Note that
   earlier field measurements were partly invalid: `PD_FAKE_MASK` could only
   repeat one button, so it navigated into the *save menu* (visible in the task
