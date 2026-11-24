@@ -1105,6 +1105,49 @@ namespace bgfx
 			return kInvalidHandle;
 		}
 
+		// Shader override from disk. The engine's blobs are baked in and there is
+		// no shaderc in the tree, so this is how a shader is iterated on the
+		// device: drop <PD_SHADER_DIR>/<name>.glsl and it replaces the embedded
+		// source. Also how the Mali-specific arithmetic can be tried before it is
+		// baked into the .sc files.
+		{
+			const char* dir = getenv("PD_SHADER_DIR");
+			if (dir && dir[0])
+			{
+				auto tryOverride = [&](std::string& src, const char* name) {
+					char path[512];
+					snprintf(path, sizeof(path), "%s/%s.glsl", dir, name);
+					FILE* f = fopen(path, "rb");
+					if (!f) return;
+					std::string text;
+					char buf[4096];
+					size_t got;
+					while ((got = fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, got);
+					fclose(f);
+					if (!text.empty())
+					{
+						src = text;
+						fprintf(stderr, "[gles] shader override: %s (%zu bytes)\n", path, text.size());
+					}
+				};
+				tryOverride(vsSrc, g_shaderSlots[_vsh].name);
+				tryOverride(psSrc, g_shaderSlots[_psh].name);
+			}
+		}
+
+		// Diagnostic: PD_DUMP_SHADERS=<dir> writes every compiled source to disk,
+		// which is how the optimised variants are produced from the real input.
+		if (const char* dd = getenv("PD_DUMP_SHADERS"))
+		{
+			auto dumpOne = [&](const std::string& src, const char* name) {
+				char path[512];
+				snprintf(path, sizeof(path), "%s/%s.glsl", dd, name);
+				if (FILE* f = fopen(path, "wb")) { fwrite(src.data(), 1, src.size(), f); fclose(f); }
+			};
+			dumpOne(vsSrc, g_shaderSlots[_vsh].name);
+			dumpOne(psSrc, g_shaderSlots[_psh].name);
+		}
+
 		GLuint vs = compileStage(GL_VERTEX_SHADER, vsSrc, g_shaderSlots[_vsh].name);
 		if (!vs) return kInvalidHandle;
 		GLuint fs = compileStage(GL_FRAGMENT_SHADER, psSrc, g_shaderSlots[_psh].name);
