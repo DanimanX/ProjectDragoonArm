@@ -2207,19 +2207,41 @@ bool azelSdl_EndFrame()
     {
         ZoneScopedN("WaitNextFrame");
 
-        static Uint64 last_time = SDL_GetPerformanceCounter();
-        Uint64 now = SDL_GetPerformanceCounter();
+        static const bool traceFps = getenv("PD_TRACE_FPS") != nullptr;
+        static Uint64 freq = SDL_GetPerformanceFrequency();
+        static Uint64 next_target = SDL_GetPerformanceCounter();
+        static Uint64 fps_last = SDL_GetPerformanceCounter();
+        static unsigned fps_frames = 0;
 
-        float freq = SDL_GetPerformanceFrequency();
-        float secs = (now - last_time) / freq;
-        float timeToWait = ((1.f/frameLimit) - secs) * 1000;
-        //timeToWait = 0;
-        if (timeToWait > 0)
+        Uint64 now = SDL_GetPerformanceCounter();
+        if (traceFps && ++fps_frames % 30 == 0)
         {
-            SDL_Delay(timeToWait);
+            double elapsed = (double)(now - fps_last) / (double)freq;
+            fprintf(stderr, "[fps] %.1f fps (%.1f ms/frame)\n",
+                    30.0 / elapsed, (elapsed * 1000.0) / 30.0);
+            fps_last = now;
         }
 
-        last_time = SDL_GetPerformanceCounter();
+        if (frameLimit > 0)
+        {
+            const Uint64 period = (Uint64)((double)freq / (double)frameLimit);
+            next_target += period;
+            if (next_target > now)
+            {
+                const float msToWait = (float)((double)(next_target - now) * 1000.0 / (double)freq);
+                // Avoid micro-sleeps (<4 ms) on Linux where SDL_Delay overshoot
+                // can push the next frame past the 33.3 ms vblank deadline.
+                if (msToWait >= 4.0f)
+                {
+                    SDL_Delay((Uint32)(msToWait - 2.0f));
+                }
+            }
+            else if (now - next_target > period)
+            {
+                // Clamp if we fell behind by more than one frame.
+                next_target = now;
+            }
+        }
     }
 #endif
 

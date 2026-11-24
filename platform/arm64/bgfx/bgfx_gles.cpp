@@ -1095,6 +1095,25 @@ namespace bgfx
 			        "tmpvar_23 = texture (s_vdp1Color, vec2(v_texcoord0.x, 1.0 - v_texcoord0.y));",
 			        "vdp1 composite Y flip");
 
+			// Skip sampling VDP2 layer textures whose BGON enable bit is off.
+			// Saves 1-3 fullscreen RGBA8 fetches per pixel on Mali-G31.
+			pdPatch(body,
+			        "tmpvar_24 = texture (s_nbg0, v_texcoord0);",
+			        "tmpvar_24 = (pd_mod (u_vdp2Regs0.x, 2.0) >= 1.0) ? texture (s_nbg0, v_texcoord0) : vec4(0.0);",
+			        "composite skip disabled nbg0");
+			pdPatch(body,
+			        "tmpvar_25 = texture (s_nbg1, v_texcoord0);",
+			        "tmpvar_25 = (pd_mod (u_vdp2Regs0.x, 4.0) >= 2.0) ? texture (s_nbg1, v_texcoord0) : vec4(0.0);",
+			        "composite skip disabled nbg1");
+			pdPatch(body,
+			        "tmpvar_26 = texture (s_nbg3, v_texcoord0);",
+			        "tmpvar_26 = (pd_mod (u_vdp2Regs0.x, 16.0) >= 8.0) ? texture (s_nbg3, v_texcoord0) : vec4(0.0);",
+			        "composite skip disabled nbg3");
+			pdPatch(body,
+			        "tmpvar_27 = texture (s_rbg0, v_texcoord0);",
+			        "tmpvar_27 = (pd_mod (u_vdp2Regs0.x, 32.0) >= 16.0) ? texture (s_rbg0, v_texcoord0) : vec4(0.0);",
+			        "composite skip disabled rbg0");
+
 			// PD_COMPOSITE_MODE replaces the composite result with one input, so
 			// "the screen is black" can be attributed to a specific layer instead
 			// of reasoned about from the shader text:

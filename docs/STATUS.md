@@ -57,16 +57,22 @@ but not proven. Last updated: 2026-11-24.
 | 10 | `BGFX_STATE_CULL_CW` / `BGFX_STATE_CULL_CCW` had `GL_CW` and `GL_CCW` swapped | `BGFX_STATE_CULL_CCW` culled all front-facing 3D geometry and drew only back faces, hiding ~96% of the 3D excavation chamber (`nonBlack 3.4%` -> `57.6%` after fix) |
 | 11 | `BGFX_STATE_BLEND_FUNC` packed `_dst` into the low 32 bits (colliding with write/depth/cull flags) while `submit()` read bits 40..44 | Opaque `BGFX_STATE_BLEND_FUNC(ONE, ZERO)` 3D draws read `dst=0` (`GL_ONE`) and ran as additive blending (`GL_ONE, GL_ONE`). Repacked blend factors into bits 32..39 |
 | 12 | `bgfx::copy()` / `makeRef()` never freed their allocations; `VDP1_ps` transpiled `RGBA32F` corner fetches and inverse-bilinear solver as `lowp` | Leaked ~10+ MB/sec in 3D gameplay from per-object `ndcCornersTex`; `lowp` FP16 math in `VDP1_ps` breaks UVs on Mali-G31. Freed `bgfx::Memory` on consumption, forced `highp` in `VDP1_ps`, and forced `GL_NEAREST` on `GL_FLOAT` textures |
-| 13 | Unnecessary per-frame GPU/CPU bandwidth in the VDP1/VDP2 path | Dropped dead 512 KB/frame `bgfx_vdp1_ram_texture` upload (never sampled), dirty-checked + partial-row uploaded VDP2 VRAM/CRAM, cached static VDP2 layers (`renderLayerGPU` skips redraw when VRAM/CRAM/config unchanged), removed unused `vdp1PriorityTexture` MRT attachment, scaled VDP1 FBO to 0.5x (`360x270`, configurable via `PD_VDP1_SCALE`) on ARM64, skipped unused 315 KB `vdp1TextureOutput` memset, and shrunk transient buffers from 10 MB to 1.25 MB |
-| 14 | CPK movie bottom artifact strip, shifted name-entry cursor, and D-pad ignored in 3D field | Removed obsolete `0x14040` bitmap base override (with `highp int` fixed, `MPOFN=0` + `SCYN0=16` + Window 0 `24..199` centers the 320x176 movie with clean black bars); gated `picture fit` viewport transform on `target == g_defaultFbo` so VDP1 is no longer double-shifted/scaled; reported Saturn digital controller (`m0_inputType=1`) for evdev D-pad input so Edge moves with the D-pad in 3D towns/fields |
+| 13 | Unnecessary per-frame GPU/CPU bandwidth in the VDP1/VDP2 path | Dropped dead 512 KB/frame `bgfx_vdp1_ram_texture` upload (never sampled), dirty-checked + partial-row uploaded VDP2 VRAM/CRAM, cached static VDP2 layers (`renderLayerGPU` skips redraw when VRAM/CRAM/config unchanged), removed unused `vdp1PriorityTexture` MRT attachment, scaled VDP1 FBO to 0.5x (`360x270`, configurable via `PD_VDP1_SCALE`) on ARM64, skipped disabled VDP2 layer texture fetches in `VDP2_composite_ps`, skipped unused 315 KB `vdp1TextureOutput` memset, and shrunk transient buffers from 10 MB to 1.25 MB |
+| 14 | CPK movie bottom artifact strip, shifted name-entry cursor, D-pad ignored in 3D field, and frame pacing | Removed obsolete `0x14040` bitmap base override (with `highp int` fixed, `MPOFN=0` + `SCYN0=16` + Window 0 `24..199` centers the 320x176 movie with clean black bars); gated `picture fit` viewport transform on `target == g_defaultFbo` so VDP1 is no longer double-shifted/scaled; reported Saturn digital controller (`m0_inputType=1`) for evdev D-pad input so Edge moves with the D-pad in 3D towns/fields; fixed `WaitNextFrame` drift/micro-sleeps (`<4 ms`) that pushed frames past the 33.3 ms vblank deadline |
+
+## Verified on RG34XX (2026-11-24)
+
+- **Name-entry screen & 3D field verified on Mali-G31** via direct panel captures
+  over SSH: aligned green cursor on name entry (`nonBlack 22.6%`), clean 3D
+  Excavation Site #4 corridor (`nonBlack 66.4%`), clean shutdown (`rc=0`).
+- **30.0 FPS locked across all stages on the RG34XX** (`PD_TRACE_FPS=1`,
+  un-synced):
+  - Intro / title / CPK cinematics: **29.8 – 30.5 fps** (`32.8 – 33.6 ms/frame`)
+  - Name-entry screen: **29.4 – 30.8 fps** (`32.5 – 34.0 ms/frame`)
+  - 3D field (Excavation Site #4): **29.8 – 30.3 fps** (`33.0 – 33.6 ms/frame`
+    after first-frame shader compile at `24.0 fps`), up from `9.9 fps` (`47–73 ms` GPU).
 
 ## Pending
-
-- **Re-verify the latest fixes on the RG34XX.** Confirmed on hardware that the
-  game now boots through name entry into the 3D field; the four issues reported
-  from that run (CPK bottom strip, shifted name-entry cursor, D-pad movement in
-  3D, and slowdown) are fixed and verified on host (`docs/images/name-entry.png`,
-  `docs/images/field-3d.png`) and deployed to the RG34XX for re-test.
 
 - **Earlier field-performance notes (pre-fix baseline, to re-measure on device):**
   With `PD_SYNC_PASSES=1` before fixes #7–#13: BG0 13-15 ms, BG1 8.6 ms, BG3
