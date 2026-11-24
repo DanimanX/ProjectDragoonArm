@@ -79,26 +79,41 @@ but not proven. Last updated: 2026-11-24.
   | `bgfx::frame()` | 2 ms |
   | `StartFrame`, tasks, audio | 0.0 ms |
 
-  So the cost is in BG0's draw specifically. Established by measurement, not
-  guesswork:
-  - **BG1 and BG3 are the same size and use the same shader, and cost 0.2-0.4 ms**
-    each. So it is not generic fill rate, not the rasteriser, and not bandwidth.
-  - Skipping the 1 MB/frame VRAM upload (`PD_SKIP_VRAM_UPLOAD=1`) changes
-    nothing, so it is not texture-upload synchronisation either.
-  - Inside the layer, `bgfx::submit()` costs 0.3 ms while the 256-byte plane
-    descriptor upload shows 9-20 ms — a driver stall, and skipping it
-    (`PD_SKIP_PLANE_UPLOAD=1`) just moves the cost into the draw. The GPU is
-    saturated by BG0's own work.
-  - The plane descriptor is now double-buffered anyway (cheap, removes one known
-    stall), but it did not change the total.
-  Next step: the VDP2 shader's tile path does dozens of integer divisions and
-  modulos per pixel, all by power-of-two values that arrive as uniforms, so Mali
-  cannot fold them into shifts and emulates each one. Precomputing shift/mask
-  pairs on the CPU and using `>>`/`&` in the shader is the concrete fix; it needs
-  the embedded shaders regenerated.
-- The `PD_BG0_HALF` half-resolution A/B could not be trusted in the last runs
-  (the log was not being regenerated), so "does BG0's cost scale with pixel
-  count" is still formally unverified — it is the first thing to redo.
+  **Correction to an earlier reading of these numbers.** Per-phase CPU timers do
+  not attribute GPU cost, because GL commands are queued: the stall shows up
+  wherever the CPU first waits. An earlier profile therefore blamed BG0 in one
+  scene and VDP1 in another. Measuring properly — `glFinish()` at the top of the
+  frame, and between passes so each number is incremental — gives the real
+  picture on the title/movie scene:
+
+  | Pass | GPU time |
+  |---|---|
+  | previous frame drain | 47-73 ms |
+  | BG0 (352x224) | 13-15 ms |
+  | BG1 (352x224) | 8.6 ms |
+  | BG3 (352x224) | 7.4 ms |
+  | VDP1 | 30-65 ms |
+  | composite | 0.6 ms |
+  | every CPU-side phase | ~1-4 ms total |
+
+  So it is not one pathological layer: **every pass is 30-100x slower than a
+  Mali-G31 should be**. 352x224 is 79 k pixels; 8.6 ms for one textured quad
+  works out at ~9 Mpixel/s against a part good for hundreds.
+
+  The suspect is the shader code itself. Our GLES layer compiles the engine's
+  embedded EGL blobs at runtime (`compileStage`), and it already has to rename
+  the integer `mod()` that bgfx emitted for VDP2 tile maths into `pd_mod`,
+  because GLSL ES has no integer `mod`. Integer division and modulo by uniform
+  divisors are among the slowest things Mali can be asked to do, and the tile
+  path performs dozens per pixel. Fixing it properly means passing shift/mask
+  pairs precomputed on the CPU and using `>>`/`&`, which needs the embedded
+  shaders regenerated — and there is no `shaderc` in the tree, only
+  `shaderc_prebuilt.cmake` that expects one.
+
+- The half-resolution A/B for BG0 was never successfully validated (early runs
+  read a stale log), so "does the cost scale with pixel count" is still formally
+  unverified. With the corrected method it is no longer the key question: every
+  pass is slow in proportion to its pixels, so the shader is the target.
 
 - Disc swap. All four discs are deployed; only Disc 1 has been exercised.
 - In-game audio balance and whether the mixer restore interferes with anything

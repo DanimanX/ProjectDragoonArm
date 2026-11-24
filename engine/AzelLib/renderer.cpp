@@ -1479,8 +1479,30 @@ void renderComposite(bgfx::ViewId outputView, u16 backScreenColor)
     bgfx::submit(outputView, program);
 }
 
+extern "C" void pd_gpu_sync(void);
+
 bool azelSdl_EndFrame()
 {
+    // Measure how long the previous frame's GPU work takes to drain. Per-phase
+    // CPU timers cannot attribute GPU cost (commands are queued), which is how an
+    // earlier profile blamed BG0 in one scene and VDP1 in another.
+    static const bool traceGpu = getenv("PD_TRACE_FRAME") != nullptr;
+    struct timespec g0, g1;
+    if (traceGpu) clock_gettime(CLOCK_MONOTONIC, &g0);
+    if (traceGpu) pd_gpu_sync();
+    if (traceGpu)
+    {
+        clock_gettime(CLOCK_MONOTONIC, &g1);
+        static unsigned n = 0;
+        static double sum = 0;
+        sum += (g1.tv_sec - g0.tv_sec) * 1000.0 + (g1.tv_nsec - g0.tv_nsec) / 1e6;
+        if (++n % 30 == 0)
+        {
+            fprintf(stderr, "[gpu] previous frame drained in %.1fms\n", sum / 30);
+            sum = 0;
+        }
+    }
+
     {
         // Diagnostic: PDS_DUMP_VRAM=<dir> dumps Saturn VRAM + layer targets once,
         // after a while, so a headless build can be inspected without a display.
@@ -1599,12 +1621,12 @@ bool azelSdl_EndFrame()
     struct timespec b0, b1, b2, b3;
     if (traceRender) clock_gettime(CLOCK_MONOTONIC, &b0);
     renderBG0(vdp2ResolutionWidth, vdp2ResolutionHeight, BG0_GPU);
-    if (traceRender) clock_gettime(CLOCK_MONOTONIC, &b1);
+    if (traceRender) { pd_gpu_sync(); clock_gettime(CLOCK_MONOTONIC, &b1); }
     renderBG1(vdp2ResolutionWidth, vdp2ResolutionHeight, BG1_GPU);
-    if (traceRender) clock_gettime(CLOCK_MONOTONIC, &b2);
+    if (traceRender) { pd_gpu_sync(); clock_gettime(CLOCK_MONOTONIC, &b2); }
     //renderBG2(vdp2ResolutionWidth, vdp2ResolutionHeight);
     renderBG3(vdp2ResolutionWidth, vdp2ResolutionHeight, BG3_GPU);
-    if (traceRender) clock_gettime(CLOCK_MONOTONIC, &b3);
+    if (traceRender) { pd_gpu_sync(); clock_gettime(CLOCK_MONOTONIC, &b3); }
     renderRBG0(vdp2ResolutionWidth, vdp2ResolutionHeight, RBG0_GPU);
 
     if(!isShipping())
@@ -1772,9 +1794,9 @@ bool azelSdl_EndFrame()
 
         if (useVDP1GL)
         {
-            if (traceRender) clock_gettime(CLOCK_MONOTONIC, &rb);
+            if (traceRender) { pd_gpu_sync(); clock_gettime(CLOCK_MONOTONIC, &rb); }
             renderVdp1ToGL(internalResolution[0], internalResolution[1]);
-            if (traceRender) clock_gettime(CLOCK_MONOTONIC, &rc);
+            if (traceRender) { pd_gpu_sync(); clock_gettime(CLOCK_MONOTONIC, &rc); }
         }
     }
     
@@ -1794,7 +1816,7 @@ bool azelSdl_EndFrame()
         // TODOL set the bgfx back color to this color
 
         renderComposite(CompositeView, backScreenColor);
-        if (traceRender) clock_gettime(CLOCK_MONOTONIC, &rd);
+        if (traceRender) { pd_gpu_sync(); clock_gettime(CLOCK_MONOTONIC, &rd); }
     }
 #endif
 

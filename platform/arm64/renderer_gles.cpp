@@ -197,6 +197,7 @@ static PD_EGLBoolean (*p_eglDestroyContext_fn)(PD_EGLDisplay, PD_EGLContext) = n
 static PD_EGLBoolean (*p_eglMakeCurrent_fn)(PD_EGLDisplay, PD_EGLSurface, PD_EGLSurface,
                                             PD_EGLContext) = nullptr;
 static PD_EGLBoolean (*p_eglTerminate_fn)(PD_EGLDisplay) = nullptr;
+static PD_EGLBoolean (*p_eglWaitClient_fn)(void) = nullptr;
 
 // Picks which framebuffer page to publish to: the one that is not on screen.
 static void fbdev_present()
@@ -458,6 +459,7 @@ static bool createFbdevEglContext()
     p_eglMakeCurrent_fn = (PD_EGLBoolean (*)(PD_EGLDisplay, PD_EGLSurface, PD_EGLSurface,
                                              PD_EGLContext))dlsym(lib, "eglMakeCurrent");
     p_eglTerminate_fn = (PD_EGLBoolean (*)(PD_EGLDisplay))dlsym(lib, "eglTerminate");
+    p_eglWaitClient_fn = (PD_EGLBoolean (*)(void))dlsym(lib, "eglWaitClient");
 
     if (!getDisplay || !initialize || !chooseConfig || !createContext ||
         !createWindowSurface || !makeCurrent || !g_eglSwapBuffersFn)
@@ -939,6 +941,16 @@ static void evdevPollPad()
             g_evMask = 0;
         }
     }
+}
+
+// Drain the GPU. GL calls are queued, so a CPU-side timer measures queueing,
+// not work: the stall surfaces wherever the CPU first waits. Calling this at the
+// top of a frame attributes the previous frame's GPU time correctly, which is
+// how the per-phase timings were caught blaming the wrong pass.
+extern "C" void pd_gpu_sync(void)
+{
+    if (g_finishFn) g_finishFn();
+    else if (p_eglWaitClient_fn) p_eglWaitClient_fn();
 }
 
 extern "C" unsigned pd_evdev_pad_mask(void)
