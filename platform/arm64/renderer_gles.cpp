@@ -79,11 +79,14 @@ typedef unsigned  PD_EGLBoolean;
 static PD_EGLDisplay g_eglDisplay = nullptr;
 static PD_EGLSurface g_eglSurface = nullptr;
 static PD_EGLContext g_eglContext = nullptr;
+extern "C" void pdgles_set_surface_fbo(unsigned fbo);
+
 // True when the surface is a Mali fbdev_window and eglSwapBuffers presents by
 // itself (no CPU readback needed).
 static bool g_eglDirect = false;
 static bool g_offscreenPresent = false;
 static void (*g_eglSwapBuffersFn)(PD_EGLDisplay, PD_EGLSurface) = nullptr;
+static int (*g_eglGetErrorFn)(void) = nullptr;
 
 // ---------------------------------------------------------------------------
 // Presentation over /dev/fb0.
@@ -453,6 +456,7 @@ static bool createFbdevEglContext()
     FnBindAPI bindAPI = (FnBindAPI)dlsym(lib, "eglBindAPI");
     FnSwapInterval swapInterval = (FnSwapInterval)dlsym(lib, "eglSwapInterval");
     FnGetError getError = (FnGetError)dlsym(lib, "eglGetError");
+    g_eglGetErrorFn = getError;
     g_eglSwapBuffersFn = (void (*)(PD_EGLDisplay, PD_EGLSurface))dlsym(lib, "eglSwapBuffers");
     p_eglDestroySurface_fn = (PD_EGLBoolean (*)(PD_EGLDisplay, PD_EGLSurface))dlsym(lib, "eglDestroySurface");
     p_eglDestroyContext_fn = (PD_EGLBoolean (*)(PD_EGLDisplay, PD_EGLContext))dlsym(lib, "eglDestroyContext");
@@ -593,6 +597,29 @@ static bool createFbdevEglContext()
         fprintf(stderr, "[port] egl-fbdev: eglMakeCurrent failed (0x%x)\n",
                 getError ? getError() : 0);
         return false;
+    }
+
+    // Ask the driver which framebuffer the window surface actually is. libmali
+    // over fbdev does not report 0 here, and the port used to hardcode 0 when
+    // publishing the finished frame: every draw in that path went to an
+    // unrelated framebuffer, so the panel stayed black while the offscreen
+    // frame was perfect. Resolve glGetIntegerv from this context and read it
+    // before anything else binds a framebuffer.
+    {
+        void* gllib = dlopen("libGLESv2.so.2", RTLD_NOW | RTLD_GLOBAL);
+        typedef void (*FnGetIntegerv)(unsigned, int*);
+        FnGetIntegerv getInt = gllib ? (FnGetIntegerv)dlsym(gllib, "glGetIntegerv") : nullptr;
+        if (getInt)
+        {
+            int bound = -1;
+            getInt(0x8CA6 /* GL_FRAMEBUFFER_BINDING */, &bound);
+            pdgles_set_surface_fbo((unsigned)bound);
+            fprintf(stderr, "[port] egl-fbdev: surface framebuffer id %d\n", bound);
+        }
+        else
+        {
+            fprintf(stderr, "[port] egl-fbdev: cannot query the surface framebuffer\n");
+        }
     }
 
     // The engine paces itself to 30 Hz; a vsynced swap keeps the flips tear-free
@@ -761,6 +788,17 @@ static void swapWindow()
         fbdevWaitVsync();
         pdgles_offscreen_present();
         g_eglSwapBuffersFn(g_eglDisplay, g_eglSurface);
+        {
+            // A swap that fails is silent in GL terms and leaves the panel showing
+            // whatever it had. Report it instead of guessing at the driver.
+            static const bool traceSwap = getenv("PD_TRACE_PRESENT") != nullptr;
+            static unsigned n = 0;
+            if (traceSwap && ++n % 60 == 1)
+            {
+                const int err = g_eglGetErrorFn ? g_eglGetErrorFn() : -1;
+                fprintf(stderr, "[swap] offscreen swap done, eglError 0x%x\n", (unsigned)err);
+            }
+        }
         clock_gettime(CLOCK_MONOTONIC, &b);
         if (trace)
         {

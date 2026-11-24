@@ -676,6 +676,7 @@ namespace bgfx
 		if (!loadGL()) return false;
 
 		p_glGetIntegerv(GL_FRAMEBUFFER_BINDING, (GLint*)&g_defaultFbo);
+		fprintf(stderr, "[gles] default framebuffer id %u at init\n", (unsigned)g_defaultFbo);
 		p_glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 		p_glPixelStorei(GL_PACK_ALIGNMENT, 1);
 		p_glDisable(GL_CULL_FACE);
@@ -1035,6 +1036,35 @@ namespace bgfx
 			     at = body.find("lowp int ", at + 1))
 			{
 				body.replace(at, 9, "highp int ");
+			}
+		}
+		if (strstr(label, "composite") != nullptr)
+		{
+			// PD_COMPOSITE_MODE replaces the composite result with one input, so
+			// "the screen is black" can be attributed to a specific layer instead
+			// of reasoned about from the shader text:
+			//   1 = VDP1 colour, magenta where VDP1 is transparent
+			//   2 = VDP1 alpha as grey
+			//   3 = VDP1 priority as grey (decoded the way the composite does)
+			//   4 = NBG0 only
+			//   5 = VDP1 coverage mask
+			const char* mode = getenv("PD_COMPOSITE_MODE");
+			if (mode && mode[0] >= '1' && mode[0] <= '7')
+			{
+				static const char* repl[] = {
+					nullptr,
+					"  bgfx_FragColor = vec4(((vdp1Color_12.a > 0.1) ? vdp1Color_12.xyz"
+					" : vec3(1.0, 0.0, 1.0)), 1.0);\n",
+					"  bgfx_FragColor = vec4(vec3(vdp1Color_12.a), 1.0);\n",
+					"  bgfx_FragColor = vec4(vec3(clamp(floor((vdp1Color_12.a * 8.0) - 0.5),"
+					" 0.0, 7.0) / 7.0), 1.0);\n",
+					"  bgfx_FragColor = vec4(nbg0Color_11.xyz, 1.0);\n",
+					"  bgfx_FragColor = vec4(vec3(step(0.1, vdp1Color_12.a)), 1.0);\n",
+					"  bgfx_FragColor = vec4(v_texcoord0, 0.0, 1.0);\n",
+					"  bgfx_FragColor = vec4(gl_FragCoord.x / 720.0, gl_FragCoord.y / 540.0, 0.0, 1.0);\n",
+				};
+				pdPatch(body, "  bgfx_FragColor = result_2;\n", repl[mode[0] - '0'],
+				        "composite debug mode");
 			}
 		}
 		if (strstr(label, "VDP2_ps") != nullptr)
@@ -1465,6 +1495,67 @@ namespace bgfx
 		if (_mem->release) _mem->release(_mem->data, _mem->userData);
 	}
 
+	// Port diagnostic: read the bound backbuffer (whatever the port is about to
+	// present, offscreen or panel) into a raw RGBA file, plus a one-line summary
+	// so a black frame can be told from a wedge without opening the image.
+	void pdReadBackbuffer(const char* _path)
+	{
+		GLint fbo = 0;
+		p_glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo);
+		const int w = g_width, h = g_height;
+		std::vector<uint8_t> px((size_t)w * h * 4);
+		p_glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+		const GLenum err = p_glGetError();
+		size_t nonBlack = 0, opaque = 0;
+		for (size_t i = 0; i < px.size(); i += 4)
+		{
+			if (px[i] || px[i+1] || px[i+2]) ++nonBlack;
+			if (px[i+3]) ++opaque;
+		}
+		const size_t n = px.size() / 4;
+		fprintf(stderr, "[panel] fbo %d %dx%d err 0x%x nonBlack %.1f%% alphaSet %.1f%%\n",
+		        (int)fbo, w, h, err, 100.0 * nonBlack / n, 100.0 * opaque / n);
+		if (FILE* f = fopen(_path, "wb")) { fwrite(px.data(), 1, px.size(), f); fclose(f); }
+	}
+
+	// Port diagnostic: dump a colour texture to disk and report what is in it.
+	// Sampling an incomplete or never-cleared texture returns (0,0,0,1) on Mali,
+	// so a layer that is "transparent" and one that is "an unbound texture" look
+	// identical on the panel; the histogram separates them.
+	void pdReadTexture(TextureHandle _handle, const char* _path)
+	{
+		if (!isTexHandle(_handle) || !(*texSlot(_handle)).used)
+		{
+			fprintf(stderr, "[dump] texture %u is not a valid handle\n", _handle);
+			return;
+		}
+		Texture& t = (*texSlot(_handle));
+		GLuint fbo = 0;
+		p_glGenFramebuffers(1, &fbo);
+		p_glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+		p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t.id, 0);
+		std::vector<uint8_t> px((size_t)t.w * t.h * 4);
+		p_glReadPixels(0, 0, t.w, t.h, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+		const GLenum err = p_glGetError();
+		p_glBindFramebuffer(GL_FRAMEBUFFER, g_defaultFbo);
+		p_glDeleteFramebuffers(1, &fbo);
+		size_t opaqueBlack = 0, zeroAlpha = 0, other = 0, nonzero = 0;
+		for (size_t i = 0; i < px.size(); i += 4)
+		{
+			const uint8_t r = px[i], g = px[i+1], b = px[i+2], a = px[i+3];
+			if (a == 0) ++zeroAlpha;
+			else if (r == 0 && g == 0 && b == 0) ++opaqueBlack;
+			else ++other;
+			if (r || g || b) ++nonzero;
+		}
+		const size_t n = px.size() / 4;
+		fprintf(stderr, "[dump] tex %u %ux%u err 0x%x: zeroAlpha %.1f%% opaqueBlack %.1f%% other %.1f%% nonzeroRGB %.1f%%\n",
+		        _handle, t.w, t.h, err,
+		        100.0 * zeroAlpha / n, 100.0 * opaqueBlack / n, 100.0 * other / n,
+		        100.0 * nonzero / n);
+		if (FILE* f = fopen(_path, "wb")) { fwrite(px.data(), 1, px.size(), f); fclose(f); }
+	}
+
 	TextureHandle getTexture(FrameBufferHandle _handle, uint8_t _attachment)
 	{
 		if (!isFboHandle(_handle) || !fboSlot(_handle)->used) return kInvalidHandle;
@@ -1714,20 +1805,28 @@ namespace bgfx
 		g_pendingTextures.push_back({ _stage, _sampler, _handle });
 	}
 
+	// The two buffer families are drawn by different branches of submit(): the
+	// transient branch wins whenever a transient chunk is still latched. Binding
+	// a regular buffer must therefore clear the transient one, or the draw that
+	// asked for a plain quad silently reuses the last sprite/model chunk. That
+	// is what made the full-screen composite draw as a single triangle of
+	// whatever the previous 3D pass had happened to leave behind.
 	void setVertexBuffer(uint8_t, VertexBufferHandle _handle, uint32_t _start, uint32_t _num)
 	{
 		g_vb = _handle; g_vbStart = _start; g_vbCount = _num;
+		g_tvb = NULL;
 	}
 
 	void setIndexBuffer(IndexBufferHandle _handle, uint32_t _first, uint32_t _num)
 	{
 		g_ib = _handle; g_ibFirst = _first; g_ibCount = _num;
+		g_tib = NULL;
 	}
 
 	void setVertexBuffer(uint8_t, const TransientVertexBuffer* _tvb, uint32_t _start, uint32_t _num)
 	{
 		g_tvb = _tvb; g_tvbStart = _start; g_tvbCount = _num;
-		g_vb = kInvalidHandle;
+		if (_tvb) g_vb = kInvalidHandle;
 	}
 
 	void setIndexBuffer(const TransientIndexBuffer* _tib, uint32_t _first, uint32_t _num)
@@ -1898,6 +1997,9 @@ namespace bgfx
 				fprintf(stderr, "[gles]   draw: tvb=%p tib=%p vb=%u ib=%u mode=%u count16=%zu\n",
 				        (void*)g_tvb, (void*)g_tib, g_vb, g_ib, mode,
 				        g_tib ? g_tib->size / sizeof(uint16_t) : (size_t)0);
+				if (isBufHandle(g_ib) && (*bufSlot(g_ib)).used)
+					fprintf(stderr, "[gles]     regular ib count=%u first=%u\n",
+					        (unsigned)(*bufSlot(g_ib)).count, g_ibFirst);
 			}
 		}
 		if (g_tvb && g_tib && g_tvb->data && g_tib->data)
@@ -1963,8 +2065,15 @@ namespace bgfx
 			}
 			p_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ib.id);
 			GLsizei count = (GLsizei)(g_ibCount == UINT32_MAX ? ib.count - g_ibFirst : g_ibCount);
-			p_glDrawElements(mode, count, GL_UNSIGNED_SHORT,
-			                 (const void*)(uintptr_t)(g_ibFirst * sizeof(uint16_t)));
+			// PD_NO_INDEX=1 draws the same range with glDrawArrays instead of the
+			// index buffer. If a quad renders as a single triangle with indices
+			// and as a full quad without them, the index buffer is the problem.
+			static const bool noIndex = getenv("PD_NO_INDEX") != nullptr;
+			if (noIndex)
+				p_glDrawArrays(mode, (GLint)g_ibFirst, count);
+			else
+				p_glDrawElements(mode, count, GL_UNSIGNED_SHORT,
+				                 (const void*)(uintptr_t)(g_ibFirst * sizeof(uint16_t)));
 			p_glBindVertexArray(0);
 			if (glDiagEnabled())
 				if (GLenum e = p_glGetError())
@@ -2092,6 +2201,30 @@ static void prepareView(bgfx::ViewId id)
 		else
 		{
 			p_glViewport(v.x, v.y, vw, vh);
+		}
+	}
+
+	// Diagnostic: the full-frame (composite) view is the one whose rect is at
+	// least as tall as the panel. Log the viewport and scissor it ends up with,
+	// because a quad that rasterises as a triangle can only come from a
+	// viewport/clip mismatch, not from the shader.
+	{
+		static const bool traceView = getenv("PD_TRACE_COMPOSITE") != nullptr;
+		if (traceView && v.w == g_width && v.h >= g_height)
+		{
+			static uint32_t last = 0;
+			const uint32_t now = (uint32_t)(clock() / (CLOCKS_PER_SEC / 1000));
+			if (now - last >= 1000)
+			{
+				last = now;
+				GLint vp[4] = {0, 0, 0, 0};
+				if (p_glGetIntegerv) p_glGetIntegerv(0x0BA2 /*GL_VIEWPORT*/, vp);
+				fprintf(stderr, "[view] id=%u rect=%d,%d,%dx%d fbo=%u clear=0x%x "
+				        "scissor=%d(%d,%d,%d,%d) glViewport=%d,%d,%dx%d panel=%dx%d\n",
+				        (unsigned)id, v.x, v.y, v.w, v.h, (unsigned)target, (unsigned)v.clearFlags,
+				        (int)v.hasScissor, v.sx, v.sy, v.sw, v.sh,
+				        vp[0], vp[1], vp[2], vp[3], g_width, g_height);
+			}
 		}
 	}
 
@@ -2227,12 +2360,32 @@ extern "C" int pdgles_offscreen_begin(int _w, int _h)
 	return 1;
 }
 
+// The framebuffer the window surface really is, as reported by the driver at
+// context creation. Presentation must target this, not 0.
+static unsigned g_surfaceFbo = 0;
+
+extern "C" void pdgles_set_surface_fbo(unsigned _fbo)
+{
+	g_surfaceFbo = _fbo;
+}
+
 // Publish the finished offscreen frame into the real framebuffer.
 extern "C" void pdgles_offscreen_present(void)
 {
 	if (!g_presentFbo || !g_presentProg) return;
 
-	p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	{
+		static const bool traceIds = getenv("PD_TRACE_PRESENT") != nullptr;
+		if (traceIds)
+		{
+			GLint bound = -1;
+			if (p_glGetIntegerv) p_glGetIntegerv(GL_FRAMEBUFFER_BINDING, &bound);
+			fprintf(stderr, "[present] ids: presentFbo %u surface %u initDefault %u bound %d\n",
+			        g_presentFbo, g_surfaceFbo, (unsigned)g_defaultFbo, (int)bound);
+		}
+	}
+
+	p_glBindFramebuffer(GL_FRAMEBUFFER, g_surfaceFbo);
 	p_glViewport(0, 0, g_width, g_height);
 	p_glDisable(GL_SCISSOR_TEST);
 	p_glDisable(GL_DEPTH_TEST);
@@ -2248,7 +2401,47 @@ extern "C" void pdgles_offscreen_present(void)
 	if (loc >= 0) p_glUniform1i(loc, 0);
 
 	p_glBindVertexArray(0);
+	// gl_VertexID is only defined with a real VAO on some GLES3 drivers; VAO 0
+	// is not a valid vertex array object there and the draw is rejected with no
+	// visible error. Bind the port's own empty VAO instead.
+	static GLuint s_presentVao = 0;
+	if (!s_presentVao && p_glGenVertexArrays) p_glGenVertexArrays(1, &s_presentVao);
+	if (s_presentVao) p_glBindVertexArray(s_presentVao);
 	p_glDrawArrays(GL_TRIANGLES, 0, 3);
+
+	{
+		// Prove the present draw landed. Without this, "the panel is black" is
+		// ambiguous: the composite frame can be perfect in the offscreen texture
+		// while nothing reaches the framebuffer the panel scans out.
+		static const bool trace = getenv("PD_TRACE_PRESENT") != nullptr;
+		static const char* dump = getenv("PD_DUMP_PRESENT");
+		static unsigned frame = 0;
+		static unsigned taken = 0;
+		++frame;
+		if (trace && frame % 60 == 1)
+		{
+			const GLenum err = p_glGetError();
+			GLint vp[4] = {0, 0, 0, 0};
+			p_glGetIntegerv(0x0BA2 /*GL_VIEWPORT*/, vp);
+			fprintf(stderr, "[present] frame %u prog %u tex %u vao %u err 0x%x viewport %d,%d,%dx%d\n",
+			        frame, g_presentProg, g_presentTex, s_presentVao, err,
+			        vp[0], vp[1], vp[2], vp[3]);
+		}
+		if (dump && taken < 4 && frame % 60 == 1)
+		{
+			std::vector<uint8_t> px((size_t)g_width * g_height * 4);
+			p_glReadPixels(0, 0, g_width, g_height, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+			size_t nonBlack = 0;
+			for (size_t i = 0; i < px.size(); i += 4)
+				if (px[i] || px[i+1] || px[i+2]) ++nonBlack;
+			char path[512];
+			snprintf(path, sizeof(path), "%s%u.rgba", dump, taken);
+			if (FILE* f = fopen(path, "wb")) { fwrite(px.data(), 1, px.size(), f); fclose(f); }
+			fprintf(stderr, "[present] panel sample %u nonBlack %.1f%%\n",
+			        taken, 100.0 * nonBlack / (px.size() / 4));
+			taken++;
+		}
+	}
 
 	p_glBindFramebuffer(GL_FRAMEBUFFER, g_presentFbo);
 }

@@ -238,6 +238,17 @@ namespace bgfx
 	void setIndexBuffer(const TransientIndexBuffer* _tib, uint32_t _firstIndex = 0, uint32_t _numIndices = UINT32_MAX);
 	void submit(ViewId _id, ProgramHandle _program, uint32_t _depth = 0, uint8_t _flags = 0);
 
+	// Port diagnostic: read a colour texture back into a raw RGBA file and log
+	// its alpha/colour histogram. The only way to know what a pass actually
+	// wrote, as opposed to what the shader was supposed to write.
+	void pdReadTexture(TextureHandle _handle, const char* _path);
+
+	// Port diagnostic: read the currently bound backbuffer (the frame the port
+	// will present) into a raw RGBA file. Dumping from inside the frame avoids
+	// matching a /dev/fb0 grab to a game state by wall clock, which is
+	// impossible at single-digit fps.
+	void pdReadBackbuffer(const char* _path);
+
 	struct Encoder
 	{
 		void setState(uint64_t _state, uint32_t _rgba = 0);

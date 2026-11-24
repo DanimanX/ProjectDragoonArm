@@ -2,6 +2,7 @@
 #include <ctime>
 #include <cstdio>
 #include <cstdlib>
+#include <unistd.h>
 #include <soloud.h>
 
 #include <backends/imgui_impl_sdl3.h>
@@ -1475,14 +1476,16 @@ void renderComposite(bgfx::ViewId outputView, u16 backScreenColor)
                 lastTick = now;
                 fprintf(stderr,
                         "[vdp2] BGON=0x%04x PRINA=0x%04x PRINB=0x%04x PRIR=0x%04x "
-                        "TVMD=0x%04x internal=%dx%d vdp1Targets=%d\n",
+                        "TVMD=0x%04x internal=%dx%d vdp1Targets=%d prog=%d vdp1=%d nbg0=%d\n",
                         (unsigned)vdp2Controls.m4_pendingVdp2Regs->m20_BGON,
                         (unsigned)vdp2Controls.m4_pendingVdp2Regs->mF8_PRINA,
                         (unsigned)vdp2Controls.m4_pendingVdp2Regs->mFA_PRINB,
                         (unsigned)vdp2Controls.m4_pendingVdp2Regs->mFC_PRIR,
                         (unsigned)vdp2Controls.m4_pendingVdp2Regs->m0_TVMD,
                         internalResolution[0], internalResolution[1],
-                        bgfx::isValid(gBGFXVdp1PolyFB) ? 1 : 0);
+                        bgfx::isValid(gBGFXVdp1PolyFB) ? 1 : 0,
+                        bgfx::isValid(program) ? 1 : 0,
+                        (int)vdp1BufferTexture, (int)NBG_data[0].BGFXTexture);
             }
         }
     }
@@ -1514,6 +1517,28 @@ void renderComposite(bgfx::ViewId outputView, u16 backScreenColor)
         1.0f,
     };
     bgfx::setUniform(u_backColor, backColor);
+
+    // Diagnostic: PD_DUMP_TEX=<prefix> dumps the VDP1 and NBG0 colour textures
+    // when <prefix>.go appears. A texture the port never cleared samples as
+    // (0,0,0,1), which is indistinguishable on the panel from "the pass wrote
+    // opaque black", so the histogram in the log is the point of this.
+    if (const char* pfx = getenv("PD_DUMP_TEX"))
+    {
+        char go[512];
+        snprintf(go, sizeof(go), "%s.go", pfx);
+        if (access(go, F_OK) == 0)
+        {
+            remove(go);
+            static int n = 0;
+            char path[512];
+            snprintf(path, sizeof(path), "%s%d_vdp1.rgba", pfx, n);
+            bgfx::pdReadTexture(vdp1BufferTexture, path);
+            snprintf(path, sizeof(path), "%s%d_nbg0.rgba", pfx, n);
+            bgfx::pdReadTexture(NBG_data[0].BGFXTexture, path);
+            fprintf(stderr, "[dump] pair %d written\n", n);
+            n++;
+        }
+    }
 
     // Bind all textures
     bgfx::setTexture(0, s_vdp1Color, vdp1BufferTexture);
@@ -1883,6 +1908,33 @@ bool azelSdl_EndFrame()
         // TODOL set the bgfx back color to this color
 
         renderComposite(CompositeView, backScreenColor);
+
+        // Diagnostic: PD_DUMP_PANEL=<prefix> reads back the frame the port is
+        // about to present, every PD_DUMP_PANEL_EVERY frames (default 30), up to
+        // 8 samples. Reading inside the frame is what makes a sample match the
+        // game state; a /dev/fb0 grab from outside cannot be matched in time.
+        if (const char* pfx = getenv("PD_DUMP_PANEL"))
+        {
+            static unsigned every = 0;
+            static unsigned frames = 0;
+            static unsigned taken = 0;
+            if (!every)
+            {
+                const char* e = getenv("PD_DUMP_PANEL_EVERY");
+                every = e ? (unsigned)atoi(e) : 30u;
+                if (!every) every = 30;
+            }
+            if (taken < 8 && ++frames % every == 0)
+            {
+                char path[512];
+                snprintf(path, sizeof(path), "%s%u.rgba", pfx, taken);
+                bgfx::pdReadBackbuffer(path);
+                fprintf(stderr, "[panel] sample %u at frame %u BGON=0x%04x PRINA=0x%04x\n",
+                        taken, frames, (unsigned)vdp2Controls.m4_pendingVdp2Regs->m20_BGON,
+                        (unsigned)vdp2Controls.m4_pendingVdp2Regs->mF8_PRINA);
+                taken++;
+            }
+        }
         if (traceRender && syncPasses) { pd_gpu_sync(); clock_gettime(CLOCK_MONOTONIC, &rd); }
         else if (traceRender) clock_gettime(CLOCK_MONOTONIC, &rd);
     }
