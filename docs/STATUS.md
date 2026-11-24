@@ -50,6 +50,7 @@ but not proven. Last updated: 2026-11-24.
 | 3 | VDP2 VRAM masked with `0x1FFFFF` over a 512 KB array | subtitle text overwrote the task heap ~1.4 MB out of bounds |
 | 4 | Stale embedded shader table (ESSL/GLSL commented out) | no shader found for any GL backend |
 | 5 | Firmware has no SDL3 (Knulli ships SDL2 + a Mali fbdev EGL driver, no libdrm/libgbm) | `libSDL3.so.0: cannot open shared object file` at exec; no SDL video backend even if provided |
+| 6 | Transpiled VDP2 shaders declare every integer texture read `lowp int` | Mali implements `lowp int` as 16 bits, so a map base above `0x7FFF` truncated: NBG0's map at `0x10000` read `0`, and the layer drew the font instead of the tile map. Every tiled layer looked like glyph soup. Forcing `highp int` in `compileStage` fixed the title screen, the menus and all VDP2 text |
 
 ## Pending
 
