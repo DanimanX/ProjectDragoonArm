@@ -1577,8 +1577,22 @@ void renderBG0(u32 width, u32 height, bool bGPU)
 
         if (isBitmapMode)
         {
-            // Bitmap mode: VRAM base from map offset, no tile indirection
+            // Bitmap mode: VRAM base, no tile indirection.
+            //
+            // MPOFN alone is not enough here. It addresses VRAM in 128 KB banks,
+            // and the movie layer decodes its frames to a buffer that is not on a
+            // bank boundary: for 320x176 the destination is 0x25E14040, i.e.
+            // offset 0x14040, which MPOFN cannot express (0x14040 >> 17 == 0).
+            // Reading from MPOFN's bank 0 therefore returned the font graphics
+            // that unpackGraphicsToVDP2 writes at VRAM offset 0 — which is why
+            // the movie showed text glyphs drawn as graphics.
+            //
+            // Verified by dumping VDP2 VRAM mid-movie: decoding it as a 320x176
+            // XRGB bitmap at 0x14040 (stride 2048) yields a coherent frame,
+            // while decoding at 0 yields the font data.
             u32 mapOffset = (vdp2Controls.m4_pendingVdp2Regs->m3C_MPOFN & 7) << 17;
+            if (fileInfoStruct.mC_gfsHandle != nullptr)
+                mapOffset = fileInfoStruct.m1C_vramDest - 0x25E00000u;
             planeData.planeOffsets[0] = mapOffset;
             planeData.planeOffsets[1] = 0;
             planeData.planeOffsets[2] = 0;
