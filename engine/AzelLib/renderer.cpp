@@ -1007,6 +1007,7 @@ void PolyLineDraw(s_vdp1Command* vdp1EA)
 void renderVdp1ToGL(u32 width, u32 height)
 {
     ZoneScopedN("renderVdp1ToGL");
+    s_vdp1Command pdWalk[32] = {};
 
     // Port diagnostic: how many VDP1 commands the field actually issues, by
     // command type. The field is all 3D polygons; the title is sprites. If the
@@ -1037,6 +1038,9 @@ void renderVdp1ToGL(u32 width, u32 height)
 
         if (traceVdp1)
         {
+            // Record the walk in order: the list is linked, so raw array
+            // indices are not what gets drawn.
+            if (totalCmds < 32) pdWalk[totalCmds] = command;
             if (COMM < 16) cmdCounts[COMM]++;
             totalCmds++;
         }
@@ -1090,6 +1094,28 @@ void renderVdp1ToGL(u32 width, u32 height)
             assert(0);
         }
 
+    }
+
+    if (traceVdp1 && totalCmds >= 8)
+    {
+        static u32 lastDump = 0;
+        const u32 now = SDL_GetTicks();
+        if (now - lastDump >= 2000)
+        {
+            lastDump = now;
+            fprintf(stderr, "[vdp1g] %u commands in draw order\n", totalCmds);
+            for (unsigned n = 0; n < totalCmds && n < 32; ++n)
+            {
+                const s_vdp1Command& d = pdWalk[n];
+                fprintf(stderr,
+                        "[vdp1g]  #%u ctrl=%04x pm=%04x col=%04x srca=%04x size=%04x "
+                        "A=(%d,%d) B=(%d,%d) C=(%d,%d) D=(%d,%d)\n",
+                        n, (unsigned)d.m0_CMDCTRL, (unsigned)d.m4_CMDPMOD,
+                        (unsigned)d.m6_CMDCOLR, (unsigned)d.m8_CMDSRCA, (unsigned)d.mA_CMDSIZE,
+                        d.mC_CMDXA, d.mE_CMDYA, d.m10_CMDXB, d.m12_CMDYB,
+                        d.m14_CMDXC, d.m16_CMDYC, d.m18_CMDXD, d.m1A_CMDYD);
+            }
+        }
     }
 
     if (traceVdp1)
