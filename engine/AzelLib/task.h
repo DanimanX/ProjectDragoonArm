@@ -1,5 +1,18 @@
 #pragma once
 
+#include <cstdlib>
+#include <cstdio>
+
+// Port diagnostic (PD_TRACE_TASKS=1): logs the task graph at creation, where the
+// name is already known. The engine's own PDS logger is compiled out in shipping
+// builds, and this trace is how a stalled scene transition is located.
+inline void pdTraceTaskCreated(const char* name)
+{
+    static const bool traceTasks = getenv("PD_TRACE_TASKS") != nullptr;
+    if (traceTasks) fprintf(stderr, "[task] + %s\n", name ? name : "?");
+}
+
+
 #include <vector>
 #include "heap.h"
 struct s_workArea
@@ -262,6 +275,7 @@ T* createSubTask(p_workArea parentTask, const typename T::TypedTaskDefinition* p
         pTypeTaskDefinition->m_pInit(pNewTask);
         //((pNewTask)->*(pTypeTaskDefinition->m_pInit))();
     }
+    pdTraceTaskCreated(T::getTaskName());
     PDS_CategorizedLog(eLogCategories::log_task, "Created task %s\n", T::getTaskName());
     return pNewTask;
 }
@@ -284,6 +298,7 @@ T* createSubTaskWithCopy(s_workAreaCopy* parentTask, const typename T::TypedTask
         pTypeTaskDefinition->m_pInit(pNewTask);
         //((pNewTask)->*(pTypeTaskDefinition->m_pInit))();
     }
+    pdTraceTaskCreated(T::getTaskName());
     PDS_CategorizedLog(eLogCategories::log_task, "Created task %s\n", T::getTaskName());
     return pNewTask;
 }
@@ -306,6 +321,7 @@ T* createSiblingTaskWithCopy(s_workAreaCopy* parentTask, const typename T::Typed
         pTypeTaskDefinition->m_pInit(pNewTask);
         //((pNewTask)->*(pTypeTaskDefinition->m_pInit))();
     }
+    pdTraceTaskCreated(T::getTaskName());
     PDS_CategorizedLog(eLogCategories::log_task, "Created task %s\n", T::getTaskName());
     return pNewTask;
 }
@@ -322,6 +338,7 @@ T* createSubTaskWithArg(p_workArea parentTask, argType arg, const typename T::Ty
         pTypeTaskDefinition->m_pInit(pNewTask, arg);
         //((pNewTask)->*(pTypeTaskDefinition->m_pInit))(arg);
     }
+    pdTraceTaskCreated(T::getTaskName());
     PDS_CategorizedLog(eLogCategories::log_task, "Created task %s\n", T::getTaskName());
     return pNewTask;
 }
@@ -339,6 +356,7 @@ T* createSiblingTaskWithArg(p_workArea parentTask, argType arg, const typename T
         pTypeTaskDefinition->m_pInit(pNewTask, arg);
         //((pNewTask)->*(pTypeTaskDefinition->m_pInit))(arg);
     }
+    pdTraceTaskCreated(T::getTaskName());
     PDS_CategorizedLog(eLogCategories::log_task, "Created task %s\n", T::getTaskName());
     return pNewTask;
 }
@@ -361,6 +379,7 @@ T* createSubTaskWithArgWithCopy(s_workAreaCopy* parentTask, argType arg, const t
         pTypeTaskDefinition->m_pInit(pNewTask, arg);
         //((pNewTask)->*(pTypeTaskDefinition->m_pInit))(arg);
     }
+    pdTraceTaskCreated(T::getTaskName());
     PDS_CategorizedLog(eLogCategories::log_task, "Created task %s\n", T::getTaskName());
     return pNewTask;
 }
@@ -378,6 +397,7 @@ T* createSiblingTask(p_workArea parentTask, const typename T::TypedTaskDefinitio
         pTypeTaskDefinition->m_pInit(pNewTask);
         //((pNewTask)->*(pTypeTaskDefinition->m_pInit))(arg);
     }
+    pdTraceTaskCreated(T::getTaskName());
     PDS_CategorizedLog(eLogCategories::log_task, "Created task %s\n", T::getTaskName());
     return pNewTask;
 }

@@ -1,0 +1,28 @@
+This patch makes SDL enumerate the RG34XX controller. It exposes its stick as
+ABS_RX/ABS_RY/ABS_RZ plus ABS_HAT0X/Y and 15 gamepad buttons, and reports no
+ABS_X/ABS_Y at all. SDL_EVDEV_GuessDeviceClass() only looked for a joystick
+inside a block guarded by `test_bit(ABS_X) && test_bit(ABS_Y)`, so the device
+was classified as nothing, IsJoystick() rejected it, and the port ran with zero
+controllers — measured on the device: `SDL_GetJoysticks() == 0` while
+`/dev/input/event1` was a working evdev pad.
+
+The accelerometer check above already excludes buttonless RX/RY/RZ devices, so
+anything reaching this branch with EV_KEY set is a pad.
+Apply with: patch -p1 -d <sdl-source-dir> < this-file
+
+--- a/src/core/linux/SDL_evdev_capabilities.c	2026-11-23 11:50:12.060694693 -0300
++++ b/src/core/linux/SDL_evdev_capabilities.c	2026-11-23 11:50:12.060694693 -0300
+@@ -94,8 +94,12 @@
+         return SDL_UDEV_DEVICE_ACCELEROMETER;
+     }
+ 
++    /* Some handheld pads (Anbernic RG34XX among them) expose their stick as
++     * ABS_RX/ABS_RY and never report ABS_X/ABS_Y, so requiring X/Y rejected a
++     * real evdev gamepad and SDL found no controllers. Accept either pair. */
+     if (test_bit(EV_ABS, bitmask_ev) &&
+-        test_bit(ABS_X, bitmask_abs) && test_bit(ABS_Y, bitmask_abs)) {
++        ((test_bit(ABS_X, bitmask_abs) && test_bit(ABS_Y, bitmask_abs)) ||
++         (test_bit(ABS_RX, bitmask_abs) && test_bit(ABS_RY, bitmask_abs)))) {
+         if (test_bit(BTN_STYLUS, bitmask_key) || test_bit(BTN_TOOL_PEN, bitmask_key)) {
+             ; // ID_INPUT_TABLET
+         } else if (test_bit(BTN_TOOL_FINGER, bitmask_key) && !test_bit(BTN_TOOL_PEN, bitmask_key)) {

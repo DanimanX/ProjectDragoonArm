@@ -248,6 +248,13 @@ static void openMovieStream(const char* cpkFileName)
     s32 w = (s32)fileInfoStruct.m20_videoWidth;
     s32 h = (s32)fileInfoStruct.m24_videoHeight;
     pRegs->mC0_WPSX0 = (s16)(((0x160 - w) >> 1) << 1);
+    if (getenv("PD_TRACE_MOVIE"))
+        fprintf(stderr, "[movie] window w=%d h=%d -> WPSX0=%d WPSY0=%d WPEX0=%d WPEY0=%d\n",
+                (int)w, (int)h,
+                (int)((((0x160 - w) >> 1) << 1)),
+                (int)((0xE0 - h) >> 1),
+                (int)((((w + 0x15F) >> 1) << 1)),
+                (int)(h + 0xDF));
     pRegs->mC2_WPSY0 = (s16)((0xE0 - h) >> 1);
     pRegs->mC4_WPEX0 = (s16)(((w + 0x15F) >> 1) << 1);
     pRegs->mC6_WPEY0 = (s16)((h + 0xDF) >> 1);
@@ -284,12 +291,26 @@ void closeMovieStream()
 {
     if (fileInfoStruct.mC_gfsHandle)
     {
-        // Stop movie audio stream
-        if (s_movieAudioHandle)
-        {
-            gSoloud.stop(s_movieAudioHandle);
-            s_movieAudioHandle = 0;
-        }
+        // Stop movie audio stream.
+        // The handle must be validated first: stopping a stale one deletes a
+        // voice that is no longer ours, and on the handheld that ended in a
+        // SIGSEGV inside SoLoud right as the movie finished — leaving the game
+        // with the last audio still playing and a frozen picture. The town
+        // cutscene path already guards this way (townCutscene.cpp).
+        // Stop by SOURCE, not by handle. A raw handle stop re-reads mVoice[] and
+        // deletes the instance, and with the SoLoud mixer thread running that
+        // turned into a use-after-free inside stopVoice_internal (observed on the
+        // device: SIGSEGV at this exact line as the intro movie ended, leaving a
+        // frozen black screen with the audio still going). stopAudioSource()
+        // walks the voices under the audio mutex and only touches live ones.
+        // Do NOT stop the voice here. The movie audio instance ends itself:
+        // its hasEnded() turns true once the decoder marks the ring buffer
+        // finished and it has drained, and SoLoud's mixer thread then deletes
+        // the voice. Stopping it from this thread as well raced with that
+        // deletion and segfaulted exactly as the intro movie ended. Dropping
+        // the handle is enough; the buffer is a static, so the instance stays
+        // valid until the mixer reaps it.
+        s_movieAudioHandle = 0;
 
         // Stop and destroy Cinepak decoder
         if (fileInfoStruct.m10_movieDecoder)
@@ -856,6 +877,24 @@ void s_movieMainWorkArea::Init(s_movieMainWorkArea* pThis, s32 movieIndex)
 // 060540fa
 void s_movieMainWorkArea::Draw(s_movieMainWorkArea* pThis)
 {
+    // Port diagnostic (PD_TRACE_MOVIE=1): the movie state machine. The field
+    // never appears after the intro, so this shows whether the movie task ever
+    // reaches its finished state (state 6) or stalls in the countdown/fade.
+    {
+        static const bool traceMovie = getenv("PD_TRACE_MOVIE") != nullptr;
+        static s32 lastState = -1;
+        static s32 lastCountdown = -999;
+        if (traceMovie &&
+            (pThis->m0_state != lastState || pThis->m3_countdown != lastCountdown))
+        {
+            lastState = pThis->m0_state;
+            lastCountdown = pThis->m3_countdown;
+            fprintf(stderr, "[movie] state=%d countdown=%d cpk=%d gfs=%p fadeStopped=%d\n",
+                    pThis->m0_state, pThis->m3_countdown, pThis->m2_cpkIndex,
+                    fileInfoStruct.mC_gfsHandle, g_fadeControls.m0_fade0.m20_stopped);
+        }
+    }
+
     switch (pThis->m0_state)
     {
     case 0:
@@ -1241,8 +1280,22 @@ state3:
                 }
 
                 // Check if decoder finished (status 5)
+                if (getenv("PD_TRACE_MOVIE"))
+                {
+                    static u32 lastTick = 0;
+                    const u32 now = SDL_GetTicks();
+                    if (now - lastTick >= 1000)
+                    {
+                        lastTick = now;
+                        fprintf(stderr,
+                                "[movie] poll: status=%d pts=%d\n",
+                                decoder->getStatus(),
+                                (int)fileInfoStruct.m14_frameCount);
+                    }
+                }
                 if (decoder->getStatus() == 5)
                 {
+                    fprintf(stderr, "[movie] decoder finished -> closing stream\n");
                     closeMovieStream();
                 }
             }

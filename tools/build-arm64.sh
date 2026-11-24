@@ -5,9 +5,12 @@
 # Toolchain: Zig 0.17.0 as a hermetic aarch64-linux-gnu.2.28 C/C++ compiler,
 # the same pin ProjectDural uses (sha256 verified below).
 #
-# The device supplies libSDL3 and the Mali EGL/GLES drivers. Zig's sysroot has
-# neither, so this script generates a stub libSDL3 to link against (see
-# tools/make-stubs.py); EGL and GLESv2 are loaded with dlopen at runtime.
+# The device supplies the Mali EGL/GLES drivers but **not** SDL3: Knulli/Batocera
+# on the H700 ships SDL2 (with its own "Mali EGL" fbdev driver) and has no
+# libSDL3, libdrm or libgbm. Zig's sysroot has none of it either, so this script
+# generates a stub libSDL3 to link against (see tools/make-stubs.py) and the
+# package carries a real libSDL3.so.0 built by tools/build-sdl3-arm64.sh; EGL
+# and GLESv2 are loaded with dlopen at runtime.
 #
 # Usage:
 #   tools/build-arm64.sh              # build + package
@@ -58,8 +61,11 @@ echo "[3/5] compiling for aarch64"
 # symbols the objects actually reference. -k 0 keeps going past the expected
 # link failure so every object is available for the scan.
 ninja -C "$BDIR" -j "$JOBS" -k 0 panzerdragoon >"$BDIR/compile.log" 2>&1 || true
-if ! grep -q "Linking CXX executable" "$BDIR/compile.log"; then
-    grep -E "error:" "$BDIR/compile.log" | head -20
+# Only real compilation errors are fatal here. The first link is expected to fail
+# with "undefined symbol: SDL_*" because the stub library does not exist yet —
+# that is the whole point of compiling the objects first.
+if grep -E '(fatal )?error:' "$BDIR/compile.log" | grep -qvE '^(ld\.lld|/usr/bin/ld|collect2):? error:'; then
+    grep -E '(fatal )?error:' "$BDIR/compile.log" | grep -vE '^(ld\.lld|/usr/bin/ld|collect2):? error:' | head -20
     echo "compile failed" >&2
     exit 1
 fi
@@ -91,11 +97,23 @@ else
     install -m 0755 "$BIN" "$DIST/panzerdragoon/panzerdragoon.aarch64"
 fi
 {
-  echo "required shared libraries (all firmware-provided):"
+  echo "required shared libraries:"
   readelf -d "$BIN" | sed -n 's/.*Shared library: \[\(.*\)\]/  \1/p'
+  echo "  (SDL3 ships in libs.aarch64; the rest are firmware-provided)"
   echo "max GLIBC symbol version:"
   readelf -V "$BIN" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1 | sed 's/^/  /'
 } > "$DIST/panzerdragoon/DEPENDENCIES.txt"
+
+# The firmware on the H700 ships SDL2 only, so the port carries its own SDL3
+# (built by tools/build-sdl3-arm64.sh with the backends that firmware can serve).
+SDL3_SO="$ROOT/build-sdl3/libSDL3.so.0.4.20"
+if [ -f "$SDL3_SO" ]; then
+    install -m 0755 "$SDL3_SO" "$DIST/panzerdragoon/libs.aarch64/libSDL3.so.0"
+    echo "      bundled $(basename "$SDL3_SO") as libs.aarch64/libSDL3.so.0"
+else
+    echo "      WARNING: build-sdl3/libSDL3.so.0.4.20 missing; the port will not start" >&2
+    echo "      run tools/build-sdl3-arm64.sh and re-run this script" >&2
+fi
 install -m 0644 "$ROOT/portmaster/panzerdragoon/port.json" "$DIST/panzerdragoon/port.json"
 install -m 0644 "$ROOT/portmaster/panzerdragoon/gameinfo.xml" "$DIST/panzerdragoon/gameinfo.xml" 2>/dev/null || true
 install -m 0644 "$ROOT/portmaster/panzerdragoon/README.md" "$DIST/panzerdragoon/README.md" 2>/dev/null || true

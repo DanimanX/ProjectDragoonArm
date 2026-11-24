@@ -62,7 +62,7 @@ rejected before it can boot to a black screen.
               │                     the engine uses (textures, views, state,
               │                     embedded-shader compilation, composite)
               ▼
-  SDL3 (KMSDRM/EGL) ──► Mali-G31 MP2, 720×480
+  libSDL3 (bundled) ──► libmali EGL/GLES 3 ──► Mali-G31 MP2, 720×480
 ```
 
 Why a bgfx-compatible layer instead of editing the engine: the engine calls
@@ -81,8 +81,9 @@ is a real requirement, not a preference. See `docs/PORTING-NOTES.md`.
 **It runs.** Verified on x86_64 with a real GLES 3.2 context: the port boots the
 game, presents the SEGA logo and the *AZEL* title card, holds 30.3 FPS, and the
 in-game menu opens over the running game. The ARM64 build produces a 4.5 MB
-binary needing only firmware libraries (`libSDL3.so.0`, `libGLESv2.so.2`,
-`libc`), with a maximum symbol version of `GLIBC_2.27`.
+binary needing `libGLESv2.so.2`, `libc`, `libm`, `libpthread` and `libdl` from
+the firmware, plus a `libSDL3.so.0` that the package carries itself, with a
+maximum symbol version of `GLIBC_2.27`.
 
 | Verified | Evidence |
 |---|---|
@@ -94,11 +95,41 @@ binary needing only firmware libraries (`libSDL3.so.0`, `libGLESv2.so.2`,
 | ARM64 package | `dist/PanzerDragoonArm-PortMaster-aarch64.zip`, 1.9 MB |
 | Self-check | `shim_smoketest` renders 76,800/76,800 pixels through the GLES layer |
 
-Not yet verified, stated plainly: **the binary has not run on RG34XX hardware**
-(none attached to this workstation), and it could not be run under emulation
-either — `qemu-user` is not installed and cannot be installed here (no root,
-`no-new-privs`), and `qemu-system-aarch64` needs an ARM64 rootfs with Mesa.
-Everything up to the device boundary is proven; the device run is the next step.
+**SDL3 is not a firmware library on the H700.** Knulli/Batocera ship SDL2 — with
+a home-grown "Mali EGL" fbdev video driver — and no `libSDL3`, `libdrm` or
+`libgbm`. The package therefore bundles an SDL3 built for AArch64/glibc 2.28
+(`tools/build-sdl3-arm64.sh`: video `dummy`/`offscreen`, audio ALSA loaded
+dynamically, joystick evdev) and the port takes its GLES context straight from
+libmali's EGL over `/dev/fb0`, installing its own buffer swap. See
+`platform/arm64/renderer_gles.cpp`.
+
+**It runs on the handheld.** On 2026-11-23 the port booted on an RG34XX
+(Knulli "scarab 2026/05/11"): GLES `3.2 v1.r20p0-01rel0` on Mali-G31, the SEGA
+logo and the opening scene captured directly from `/dev/fb0`.
+
+The three things that had to be measured rather than assumed, all of them on
+the device:
+
+- **EGL configs here have `surface_type == 0`.** Passing `EGL_SURFACE_TYPE`
+  makes `eglChooseConfig` fail with `EGL_BAD_ATTRIBUTE`; ask only for a
+  renderable type and depth, then create the window surface with a `NULL`
+  native handle.
+- **`eglSwapBuffers` lies on this libmali.** It returns `EGL_TRUE` and nothing
+  ever reaches the panel. The port publishes by reading the frame back and
+  writing it to the off-screen `/dev/fb0` page, then flipping.
+- **The engine needs an SDL window even when it renders elsewhere.**
+  `renderer.cpp` reads `SDL_GetWindowSize()`, so with no window the resolution
+  stays 0 and the composite draws nothing. SDL3's hint is `SDL_VIDEO_DRIVER`
+  (SDL2's `SDL_VIDEODRIVER` is ignored); the `offscreen` driver provides the
+  window object without GL, which is all that is needed.
+
+- **The codec boots with the speaker muted.** `SPK Switch` is off on this
+  firmware while the DAC mixers are on, so a perfectly good audio stream is
+  inaudible. The launcher turns it on for the session and restores the original
+  value on exit.
+
+Still unmeasured: frame rate on the H700, disc swap, and physical controller
+input — see [docs/STATUS.md](docs/STATUS.md).
 
 [docs/STATUS.md](docs/STATUS.md) keeps the full ledger, including what is known
 to be incomplete *in the engine itself* (upstream Azel is playable through the

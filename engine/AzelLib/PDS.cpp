@@ -1,4 +1,7 @@
 #include "PDS.h"
+#include <ctime>
+#include <cstdio>
+#include <cstdlib>
 #include "debugWindows.h"
 #include "inputRecorder.h"
 #include "kernel/fileBundle.h"
@@ -1128,7 +1131,14 @@ void loopIteration()
     static bool gameRunning = true;
 #endif
 
+    static const bool traceFramePhases = getenv("PD_TRACE_FRAME") != nullptr;
+    struct timespec fs0, fs1, fe0, fe1;
+    if (traceFramePhases) clock_gettime(CLOCK_MONOTONIC, &fs0);
+
     azelSdl_StartFrame();
+
+    if (traceFramePhases) clock_gettime(CLOCK_MONOTONIC, &fs1);
+
     if (!gameRunning)
     {
         if (ImGui::GetIO().MouseClicked[0])
@@ -1165,7 +1175,16 @@ void loopIteration()
 
         updateInputRecorder();
 
+        // Port diagnostic (PD_TRACE_FRAME=1): where the frame time goes. The
+        // field drops to ~1 fps while presenting costs only a few ms, so the
+        // cost has to be in one of these engine phases.
+        static const bool tracePhases = getenv("PD_TRACE_FRAME") != nullptr;
+        struct timespec t0, t1, t2, t3;
+        if (tracePhases) clock_gettime(CLOCK_MONOTONIC, &t0);
+
         runTasks();
+
+        if (tracePhases) clock_gettime(CLOCK_MONOTONIC, &t1);
 
         //waitForSh2Completion();
 
@@ -1175,12 +1194,55 @@ void loopIteration()
 
 
 
+        if (tracePhases) clock_gettime(CLOCK_MONOTONIC, &t2);
+
         lastUpdateFunction();
+
+        if (tracePhases)
+        {
+            clock_gettime(CLOCK_MONOTONIC, &t3);
+            static unsigned n = 0;
+            static double sumTasks = 0, sumFlush = 0, sumUpdate = 0;
+            auto ms = [](const struct timespec& a, const struct timespec& b) {
+                return (b.tv_sec - a.tv_sec) * 1000.0 + (b.tv_nsec - a.tv_nsec) / 1e6;
+            };
+            sumTasks += ms(t0, t1);
+            sumFlush += ms(t1, t2);
+            sumUpdate += ms(t2, t3);
+            if (++n % 30 == 0)
+            {
+                fprintf(stderr, "[phase] tasks=%.1fms vdp1+audio=%.1fms lastUpdate=%.1fms "
+                                "total=%.1fms\n",
+                        sumTasks / 30, sumFlush / 30, sumUpdate / 30,
+                        (sumTasks + sumFlush + sumUpdate) / 30);
+                sumTasks = sumFlush = sumUpdate = 0;
+            }
+        }
     }
 
     audioDebug();
 
+    if (traceFramePhases) clock_gettime(CLOCK_MONOTONIC, &fe0);
+
     bContinue = azelSdl_EndFrame();
+
+    if (traceFramePhases)
+    {
+        clock_gettime(CLOCK_MONOTONIC, &fe1);
+        static unsigned n2 = 0;
+        static double sumStart = 0, sumEnd = 0;
+        auto ms2 = [](const struct timespec& a, const struct timespec& b) {
+            return (b.tv_sec - a.tv_sec) * 1000.0 + (b.tv_nsec - a.tv_nsec) / 1e6;
+        };
+        sumStart += ms2(fs0, fs1);
+        sumEnd += ms2(fe0, fe1);
+        if (++n2 % 30 == 0)
+        {
+            fprintf(stderr, "[phase] StartFrame=%.1fms EndFrame(render+present)=%.1fms\n",
+                    sumStart / 30, sumEnd / 30);
+            sumStart = sumEnd = 0;
+        }
+    }
 
     updateSoundInterrupt();
 

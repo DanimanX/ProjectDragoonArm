@@ -98,6 +98,11 @@ u32 sMovieAudioBuffer::read(float* aBuffer, u32 aSamplesToRead, u32 aBufferSize,
 MovieAudioStreamInstance::MovieAudioStreamInstance(MovieAudioStream* aParent)
 {
     m_buffer = aParent->m_buffer;
+    // Deliberately NOT DISABLE_AUTOSTOP: SoLoud reaps this voice from its own
+    // mixer thread as soon as hasEnded() (movie finished + buffer drained) says
+    // so. That thread is the only owner of voice deletion, which avoids the
+    // use-after-free that happened when closeMovieStream() stopped it from the
+    // main thread at the same time — the crash at the end of the intro movie.
 }
 
 MovieAudioStreamInstance::~MovieAudioStreamInstance()

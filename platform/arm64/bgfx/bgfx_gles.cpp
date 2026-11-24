@@ -22,6 +22,7 @@
 
 #include <bgfx/bgfx.h>
 #include <bgfx/embedded_shader.h>
+#include <unistd.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -155,6 +156,7 @@ enum : GLenum
 	X(void, glBlendFunc, (GLenum, GLenum)) \
 	X(void, glDepthFunc, (GLenum)) \
 	X(void, glDepthMask, (GLboolean)) \
+	X(void, glColorMask, (GLboolean, GLboolean, GLboolean, GLboolean)) \
 	X(void, glCullFace, (GLenum)) \
 	X(void, glFrontFace, (GLenum)) \
 	X(void, glViewport, (GLint, GLint, GLsizei, GLsizei)) \
@@ -694,6 +696,8 @@ namespace bgfx
 		(void)_flags; (void)_type;
 		g_width = (int)_width;
 		g_height = (int)_height;
+		if (getenv("PD_TRACE_GEOM"))
+			fprintf(stderr, "[geom] reset backbuffer to %dx%d\n", g_width, g_height);
 	}
 
 	RendererType::Enum getRendererType() { return RendererType::OpenGLES; }
@@ -740,7 +744,13 @@ namespace bgfx
 			++submitsThisFrame;
 			if (traceEnv && (frameNo % 60) == 0)
 				fprintf(stderr, "[gles] frame %u: %u submits\n", frameNo, submitsThisFrame);
-			if (dumpEnv && (frameNo == (unsigned)atoi(dumpEnv) || (frameNo > 60 && frameNo % 120 == 0)))
+			// A snapshot can also be requested at runtime: touching /tmp/pd_snap
+			// makes the next frame dump itself once. That removes the guesswork
+			// of catching a specific frame while playing on the device.
+			const bool snapRequested = (access("/tmp/pd_snap", F_OK) == 0);
+			if (snapRequested) unlink("/tmp/pd_snap");
+			if (snapRequested ||
+			    (dumpEnv && (frameNo == (unsigned)atoi(dumpEnv) || (frameNo > 60 && frameNo % 120 == 0))))
 			{
 				const int w = g_width, h = g_height;
 				std::vector<uint8_t> px((size_t)w * h * 4);
@@ -1436,6 +1446,9 @@ namespace bgfx
 	{
 		if (_id >= 256) return;
 		g_views[_id].x = _x; g_views[_id].y = _y; g_views[_id].w = _w; g_views[_id].h = _h;
+		if (getenv("PD_TRACE_GEOM"))
+			fprintf(stderr, "[geom] setViewRect view=%u rect=%u,%u %ux%u (backbuffer %dx%d)\n",
+			        (unsigned)_id, _x, _y, _w, _h, g_width, g_height);
 	}
 	void setViewScissor(ViewId _id, uint16_t _x, uint16_t _y, uint16_t _w, uint16_t _h)
 	{
@@ -1793,7 +1806,65 @@ static void prepareView(bgfx::ViewId id)
 
 	const int vw = v.w ? v.w : g_width;
 	const int vh = v.h ? v.h : g_height;
-	p_glViewport(v.x, v.y, vw, vh);
+
+	// The engine sizes its output as (W, W*3/4) — a 4:3 frame — and draws the
+	// composite quad over all of it, but the game picture only occupies part of
+	// that frame. Measured on the device (720x540 frame): content sits at
+	// x 32..687, y 0..422, i.e. 656x423, leaving a black inset all round and
+	// running off the bottom of a 720x480 panel.
+	//
+	// So the full-frame view is mapped so that measured content rect lands on
+	// the whole panel: 656x423 -> 720x480 (a 3% horizontal difference from a
+	// uniform scale, i.e. the picture is not visibly stretched).
+	// PD_VIEW_FIT=0 disables it; PD_FRAME_CONTENT="x,y,w,h" overrides the rect.
+	{
+		static bool inited = false;
+		static float sx = 0, sy = 0, ox = 0, oy = 0;
+		static bool fit = false;
+		if (!inited)
+		{
+			inited = true;
+			const char* off = getenv("PD_VIEW_FIT");
+			fit = !(off && off[0] == '0');
+			// Content rect inside the 720x540 frame, measured from device
+			// captures of the intro/field scenes.
+			float cx = 32, cy = 42, cw = 656, ch = 374;
+			if (const char* env = getenv("PD_FRAME_CONTENT"))
+				sscanf(env, "%f,%f,%f,%f", &cx, &cy, &cw, &ch);
+			// The composite frame is (g_width, g_width*3/4), not the height of
+			// whichever view happens to be prepared first — using vh here put the
+			// picture mostly off-screen.
+			const float frameH = (float)g_width * 0.75f;
+			if (cw > 0 && ch > 0 && g_width > 0 && g_height > 0)
+			{
+				// One uniform scale so the picture is not stretched: fill the
+				// panel width and let the height land wherever the content
+				// aspect puts it, then centre it.
+				sx = (float)g_width / cw;
+				sy = sx;
+				ox = -cx * sx;
+				// Vertical nudge so the picture lands centred on the panel;
+				// the engine's inset inside the frame is not a constant, so this
+				// is measured, not derived. PD_VIEW_YCENTER overrides it.
+				float ycenter = 25.0f;
+				if (const char* yc = getenv("PD_VIEW_YCENTER")) ycenter = (float)atof(yc);
+				oy = -((frameH - cy - ch) * sy) + ((float)g_height - ch * sy) * 0.5f + ycenter;
+			}
+			if (fit)
+				fprintf(stderr, "[port] picture fit: content %.0fx%.0f in %dx%d -> scale %.3fx%.3f offset %.0f,%.0f\n",
+				        cw, ch, g_width, g_height, sx, sy, ox, oy);
+		}
+		if (fit && v.w == g_width && v.h >= g_height && sx > 0)
+		{
+			const float frameH = (float)g_width * 0.75f;
+			p_glViewport((int)(v.x + ox), (int)(v.y + oy),
+			             (int)(vw * sx + 0.5f), (int)(frameH * sy + 0.5f));
+		}
+		else
+		{
+			p_glViewport(v.x, v.y, vw, vh);
+		}
+	}
 
 	if (v.hasScissor)
 	{
@@ -1823,6 +1894,134 @@ static void prepareView(bgfx::ViewId id)
 			p_glClear(bits);
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Offscreen presentation — real double buffering over fbdev.
+//
+// The fbdev EGL surface renders straight into the framebuffer the panel is
+// scanning out, so a frame is displayed while GL is still writing it: captured
+// on the device, a single frame held two different movie frames side by side
+// (tearing), which reads as flashing. libmali rejects glBlitFramebuffer
+// (GL_INVALID_OPERATION), so the finished frame is presented by drawing the
+// offscreen colour texture into the default framebuffer with one fullscreen
+// triangle — plain textured draw, supported everywhere.
+// ---------------------------------------------------------------------------
+static GLuint g_presentFbo = 0, g_presentTex = 0, g_presentProg = 0, g_presentDepth = 0;
+static int g_presentW = 0, g_presentH = 0;
+
+static GLuint presentProgram()
+{
+	if (g_presentProg) return g_presentProg;
+	// compileStage() prepends bgfx's preamble (including #version), so these
+	// sources must not carry their own.
+	static const char* vs =
+	    "out highp vec2 v_uv;\n"
+	    "void main() {\n"
+	    "  vec2 p = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0);\n"
+	    "  v_uv = (p + 1.0) * 0.5;\n"
+	    "  gl_Position = vec4(p, 0.0, 1.0);\n"
+	    "}\n";
+	static const char* fs =
+	    "precision highp float;\n"
+	    "in highp vec2 v_uv;\n"
+	    "uniform sampler2D u_frame;\n"
+	    "out mediump vec4 o_color;\n"
+	    "void main() { o_color = texture(u_frame, v_uv); }\n";
+	GLuint v = bgfx::compileStage(GL_VERTEX_SHADER, vs, "pd_present_vs");
+	GLuint f = bgfx::compileStage(GL_FRAGMENT_SHADER, fs, "pd_present_fs");
+	if (!v || !f) return 0;
+	GLuint prog = p_glCreateProgram();
+	p_glAttachShader(prog, v);
+	p_glAttachShader(prog, f);
+	p_glLinkProgram(prog);
+	GLint linked = 0;
+	p_glGetProgramiv(prog, 0x8B82 /* GL_LINK_STATUS */, &linked);
+	if (!linked)
+	{
+		fprintf(stderr, "[present] offscreen program failed to link\n");
+		return 0;
+	}
+	g_presentProg = prog;
+	return g_presentProg;
+}
+
+// Redirect the backbuffer to an offscreen colour texture of _w x _h.
+extern "C" int pdgles_offscreen_begin(int _w, int _h)
+{
+	if (_w <= 0 || _h <= 0) return 0;
+	if (g_presentFbo && g_presentW == _w && g_presentH == _h) return 1;
+	if (!presentProgram() || !p_glGenFramebuffers || !p_glGenTextures ||
+	    !p_glFramebufferTexture2D || !p_glBindFramebuffer)
+		return 0;
+
+	if (g_presentFbo) { p_glDeleteFramebuffers(1, &g_presentFbo); g_presentFbo = 0; }
+	if (g_presentTex) { p_glDeleteTextures(1, &g_presentTex); g_presentTex = 0; }
+	if (g_presentDepth) { p_glDeleteRenderbuffers(1, &g_presentDepth); g_presentDepth = 0; }
+
+	p_glGenTextures(1, &g_presentTex);
+	p_glBindTexture(GL_TEXTURE_2D, g_presentTex);
+	p_glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, _w, _h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	p_glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	p_glBindTexture(GL_TEXTURE_2D, 0);
+
+	// Depth-stencil is required: the title screen is 2D and looked fine without
+	// it, but the field is 3D and drew a black screen (depth tests against a
+	// missing buffer). Costs one renderbuffer at panel size.
+	p_glGenRenderbuffers(1, &g_presentDepth);
+	p_glBindRenderbuffer(GL_RENDERBUFFER, g_presentDepth);
+	p_glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, _w, _h);
+	p_glBindRenderbuffer(GL_RENDERBUFFER, 0);
+
+	p_glGenFramebuffers(1, &g_presentFbo);
+	p_glBindFramebuffer(GL_FRAMEBUFFER, g_presentFbo);
+	p_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_presentTex, 0);
+	p_glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, g_presentDepth);
+	const GLenum status = p_glCheckFramebufferStatus(GL_FRAMEBUFFER);
+	if (status != 0x8CD5 /* GL_FRAMEBUFFER_COMPLETE */)
+	{
+		fprintf(stderr, "[present] offscreen FBO incomplete (0x%x)\n", status);
+		p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		p_glDeleteFramebuffers(1, &g_presentFbo); g_presentFbo = 0;
+		p_glDeleteTextures(1, &g_presentTex); g_presentTex = 0;
+		return 0;
+	}
+
+	g_presentW = _w;
+	g_presentH = _h;
+	// Everything the engine thinks it draws to "the backbuffer" now lands here.
+	g_defaultFbo = g_presentFbo;
+	fprintf(stderr, "[present] offscreen backbuffer %dx%d (double buffered)\n", _w, _h);
+	return 1;
+}
+
+// Publish the finished offscreen frame into the real framebuffer.
+extern "C" void pdgles_offscreen_present(void)
+{
+	if (!g_presentFbo || !g_presentProg) return;
+
+	p_glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	p_glViewport(0, 0, g_width, g_height);
+	p_glDisable(GL_SCISSOR_TEST);
+	p_glDisable(GL_DEPTH_TEST);
+	p_glDisable(GL_BLEND);
+	p_glDisable(GL_CULL_FACE);
+	if (p_glColorMask) p_glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+	p_glDepthMask(GL_TRUE);
+
+	p_glUseProgram(g_presentProg);
+	p_glActiveTexture(GL_TEXTURE0);
+	p_glBindTexture(GL_TEXTURE_2D, g_presentTex);
+	const GLint loc = p_glGetUniformLocation(g_presentProg, "u_frame");
+	if (loc >= 0) p_glUniform1i(loc, 0);
+
+	p_glBindVertexArray(0);
+	p_glDrawArrays(GL_TRIANGLES, 0, 3);
+
+	p_glBindFramebuffer(GL_FRAMEBUFFER, g_presentFbo);
 }
 
 // ---------------------------------------------------------------------------

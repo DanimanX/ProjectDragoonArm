@@ -1,4 +1,7 @@
 #include "PDS.h"
+#include <ctime>
+#include <cstdio>
+#include <cstdlib>
 #include "lightSetup.h"
 
 s32 pointLightParams[5];
@@ -21,7 +24,28 @@ void resetCamera(u32 x0, u32 y0, u32 x1, u32 y1, u32 centerX, u32 centerY)
 
     if (y0 > y1)
     {
-        y0 = y1;
+        // Must be a full swap, like the X axis above. The original only did
+        // `y0 = y1`, which left y1 where it was and made the vertical extent
+        // (y1 - y0) zero — a zero-area VDP1 clip, so no polygon could ever be
+        // drawn. On the field, where the whole scene is VDP1 polygons, that is
+        // a black screen with the audio still playing.
+        u32 temp = y1;
+        y1 = y0;
+        y0 = temp;
+    }
+
+    // Port diagnostic: log the clip the game asks for, so a degenerate one is
+    // visible instead of silent.
+    if (getenv("PD_TRACE_VDP1"))
+    {
+        static u32 lastTick = 0;
+        const u32 now = (u32)(clock() / (CLOCKS_PER_SEC / 1000));
+        if (now - lastTick >= 1000)
+        {
+            lastTick = now;
+            fprintf(stderr, "[camera] resetCamera(%u,%u)-(%u,%u) center=(%u,%u)\n",
+                    x0, y0, x1, y1, centerX, centerY);
+        }
     }
 
     cameraProperties.x0 = x0;

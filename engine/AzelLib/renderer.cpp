@@ -1,4 +1,7 @@
 #include "PDS.h"
+#include <ctime>
+#include <cstdio>
+#include <cstdlib>
 #include <soloud.h>
 
 #include <backends/imgui_impl_sdl3.h>
@@ -180,6 +183,11 @@ int getPriorityForLayer(eLayers layerIndex)
 
 bool closeApp = false;
 
+// Port: direct evdev pad polling, implemented in platform/arm64.
+extern "C" unsigned pd_evdev_pad_mask(void);
+// Port: set by the overlay while it owns the pad.
+extern bool pdMenuOwnsInput;
+
 struct UIState
 {
     int mousex;
@@ -310,6 +318,22 @@ void azelSdl_StartFrame()
     }
 
 #ifndef USE_NULL_RENDERER
+    // Port fix: this firmware's SDL reports joystick state as frozen — every
+    // SDL_GetGamepadButton() returns 0 — while events arrive normally (the
+    // overlay's Start+Select toggle proved that). So the game's input is driven
+    // by events, accumulated between frames. That also makes it independent of
+    // the frame rate: polling once per frame loses any press shorter than the
+    // frame, which is exactly what happened at 8 fps.
+    struct PadEventState
+    {
+        u16 mask = 0;
+        s16 axis[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        int hat = 0;
+        bool seen = false;
+        unsigned events = 0;
+    };
+    static PadEventState g_padEvent;
+
     SDL_Event event;
     while (SDL_PollEvent(&event))
     {
@@ -347,6 +371,59 @@ void azelSdl_StartFrame()
                 gUIState.mousedown = 0;
             }
             break;
+        // SDL never delivers these on the handheld (see pd_evdev_pad_mask), so
+        // they are kept only as a fallback for platforms where it does.
+        case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+        case SDL_EVENT_GAMEPAD_BUTTON_UP:
+        {
+            const bool down = (event.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN);
+            u16 bit = 0;
+            switch (event.gbutton.button)
+            {
+            case SDL_GAMEPAD_BUTTON_SOUTH:         bit = 0x0001; break; // A
+            case SDL_GAMEPAD_BUTTON_EAST:          bit = 0x0002; break; // B
+            case SDL_GAMEPAD_BUTTON_NORTH:         bit = 0x0004; break; // C
+            case SDL_GAMEPAD_BUTTON_WEST:          bit = 0x0800; break; // X
+            case SDL_GAMEPAD_BUTTON_START:         bit = 0x0008; break;
+            case SDL_GAMEPAD_BUTTON_BACK:          bit = 0x8000; break; // L (Saturn)
+            case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: bit = 0x8000; break; // L
+            case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER:bit = 0x1000; break; // R
+            case SDL_GAMEPAD_BUTTON_DPAD_UP:       bit = 0x0010; break;
+            case SDL_GAMEPAD_BUTTON_DPAD_DOWN:     bit = 0x0020; break;
+            case SDL_GAMEPAD_BUTTON_DPAD_LEFT:     bit = 0x0040; break;
+            case SDL_GAMEPAD_BUTTON_DPAD_RIGHT:    bit = 0x0080; break;
+            default: break;
+            }
+            if (bit)
+            {
+                g_padEvent.events++;
+                if (down) g_padEvent.mask |= bit;
+                else      g_padEvent.mask &= (u16)~bit;
+                g_padEvent.seen = true;
+            }
+            break;
+        }
+        case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+        {
+            const int a = event.gaxis.axis;
+            if (a >= 0 && a < 8) g_padEvent.axis[a] = event.gaxis.value;
+            g_padEvent.seen = true;
+            break;
+        }
+        case SDL_EVENT_JOYSTICK_HAT_MOTION:
+        {
+            // SDL3 reports d-pad presses as gamepad button events; this is the
+            // raw hat, kept for drivers that only send it.
+            const int h = event.jhat.value;
+            g_padEvent.hat = h;
+            g_padEvent.mask &= (u16)~(0x0010 | 0x0020 | 0x0040 | 0x0080);
+            if (h & SDL_HAT_UP)    g_padEvent.mask |= 0x0010;
+            if (h & SDL_HAT_DOWN)  g_padEvent.mask |= 0x0020;
+            if (h & SDL_HAT_LEFT)  g_padEvent.mask |= 0x0040;
+            if (h & SDL_HAT_RIGHT) g_padEvent.mask |= 0x0080;
+            g_padEvent.seen = true;
+            break;
+        }
         case SDL_EVENT_MOUSE_WHEEL:
             if (event.wheel.y > 0)
             {
@@ -408,9 +485,13 @@ void azelSdl_StartFrame()
     // Track which input source is active: switch on actual input activity
     static bool useGamepad = false;
 
+    // Port patch (see patches/README.md #5): while the port's overlay menu is
+    // open it owns the pad, so the game must not also act on those presses.
+    const bool pd_inputSuppressed = pdMenuOwnsInput;
+
     // --- Gamepad ---
     bool gamepadHasInput = false;
-    if (controller)
+    if (controller && !pd_inputSuppressed)
     {
         // Saturn button mapping:
         // 0x0001=A, 0x0002=B, 0x0004=C, 0x0008=Start
@@ -455,6 +536,38 @@ void azelSdl_StartFrame()
         if (gamepadHasInput)
             useGamepad = true;
 
+        // Port diagnostic (PD_TRACE_INPUT=1): the FINAL mask, after merging the
+        // event-driven state. Logging before the merge hid every press.
+        {
+            static const bool traceInput = getenv("PD_TRACE_INPUT") != nullptr;
+            if (traceInput)
+            {
+                static u16 lastMask = 0xFFFF;
+                static unsigned beats = 0;
+                static unsigned lastEvents = 0;
+                const bool activity = (g_padEvent.events != lastEvents);
+                lastEvents = g_padEvent.events;
+                if (++beats % 120 == 0)
+                    fprintf(stderr, "[game] alive: pad=%p suppressed=%d final=0x%04x events=%u\n",
+                            (void*)controller, (int)pd_inputSuppressed, buttonMask,
+                            g_padEvent.events);
+                if (buttonMask != lastMask || activity)
+                {
+                    lastMask = buttonMask;
+                    fprintf(stderr,
+                            "[game] mask=0x%04x (A=%d B=%d C=%d X=%d Y=%d L=%d R=%d S=%d U=%d D=%d Lt=%d Rt=%d) stick=%d,%d ev=%u\n",
+                            buttonMask,
+                            (buttonMask & 0x0001) != 0, (buttonMask & 0x0002) != 0,
+                            (buttonMask & 0x0004) != 0, (buttonMask & 0x0800) != 0,
+                            (buttonMask & 0x4000) != 0, (buttonMask & 0x8000) != 0,
+                            (buttonMask & 0x1000) != 0, (buttonMask & 0x0008) != 0,
+                            (buttonMask & 0x0010) != 0, (buttonMask & 0x0020) != 0,
+                            (buttonMask & 0x0040) != 0, (buttonMask & 0x0080) != 0,
+                            stickX, stickY, g_padEvent.events);
+                }
+            }
+        }
+
         setButtons(buttonMask);
 
         pending.m2_analogX = convertAxis(stickX);
@@ -465,12 +578,26 @@ void azelSdl_StartFrame()
         pending.m5 = (s8)(rightTrigger >> 7);
     }
 
+    // --- Direct evdev pad (platform layer) ---
+    // SDL's joystick layer delivers no events and reports frozen state inside
+    // this process on the handheld, while the same device reads fine through
+    // evdev. The platform layer polls it and hands over a Saturn bitmask.
+    if (!pd_inputSuppressed)
+    {
+        const unsigned ev = pd_evdev_pad_mask();
+        if (ev & 0xFFFFu)
+        {
+            setButtons((u16)(ev & 0xFFFFu));
+            useGamepad = true;
+        }
+    }
+
     // --- Keyboard ---
     {
-        const bool* keyState = SDL_GetKeyboardState(NULL);
+        const bool* keyState = pd_inputSuppressed ? nullptr : SDL_GetKeyboardState(NULL);
         bool keyboardHasInput = false;
 
-        for (int i = 0; i < SDL_SCANCODE_COUNT; i++)
+        for (int i = 0; keyState && i < SDL_SCANCODE_COUNT; i++)
         {
             if (keyState[i])
             {
@@ -506,6 +633,29 @@ void azelSdl_StartFrame()
 
     // Input type: digital (1) for keyboard, analog (2) for gamepad
     // Switches based on last active input source
+    // Port test hook: inject a synthetic button mask so the field can be reached
+    // and measured without a controller. PD_FAKE_MASK is a hex Saturn mask
+    // (0x0008 = Start); it pulses every PD_FAKE_PERIOD_MS for PD_FAKE_HOLD_MS
+    // starting at PD_FAKE_AT_MS, which is enough to walk the title menu.
+    {
+        static const char* fakeMaskEnv = getenv("PD_FAKE_MASK");
+        if (fakeMaskEnv)
+        {
+            static u32 t0 = 0;
+            if (!t0) t0 = SDL_GetTicks();
+            const u32 now = SDL_GetTicks() - t0;
+            const u32 at = getenv("PD_FAKE_AT_MS") ? (u32)atoi(getenv("PD_FAKE_AT_MS")) : 4000;
+            const u32 hold = getenv("PD_FAKE_HOLD_MS") ? (u32)atoi(getenv("PD_FAKE_HOLD_MS")) : 250;
+            const u32 period = getenv("PD_FAKE_PERIOD_MS") ? (u32)atoi(getenv("PD_FAKE_PERIOD_MS")) : 1500;
+            if (now >= at && period > 0 && ((now - at) % period) < hold)
+            {
+                u16 mask = (u16)strtoul(fakeMaskEnv, nullptr, 16);
+                setButtons(mask);
+                useGamepad = true;
+            }
+        }
+    }
+
     pending.m0_inputType = useGamepad ? 2 : 1;
 
     if (!isShipping())
@@ -830,6 +980,14 @@ void renderVdp1ToGL(u32 width, u32 height)
 {
     ZoneScopedN("renderVdp1ToGL");
 
+    // Port diagnostic: how many VDP1 commands the field actually issues, by
+    // command type. The field is all 3D polygons; the title is sprites. If the
+    // counts are non-zero but nothing appears, the bug is in the draw path, and
+    // if they are zero the game is not submitting anything at all.
+    static const bool traceVdp1 = getenv("PD_TRACE_VDP1") != nullptr;
+    unsigned cmdCounts[16] = {0};
+    unsigned totalCmds = 0;
+
     s_vdp1Command* vdp1EA = &mainContextVdp1[0][0];
 
     while (1)
@@ -847,6 +1005,12 @@ void renderVdp1ToGL(u32 width, u32 height)
         if (END)
         {
             break;
+        }
+
+        if (traceVdp1)
+        {
+            if (COMM < 16) cmdCounts[COMM]++;
+            totalCmds++;
         }
 
         switch (COMM)
@@ -898,6 +1062,25 @@ void renderVdp1ToGL(u32 width, u32 height)
             assert(0);
         }
 
+    }
+
+    if (traceVdp1)
+    {
+        static u32 lastTick = 0;
+        const u32 now = SDL_GetTicks();
+        if (now - lastTick >= 1000)
+        {
+            lastTick = now;
+            fprintf(stderr, "[vdp1] total=%u  normal=%u scaled=%u poly=%u polyln=%u line=%u"
+                            "  other=", totalCmds, cmdCounts[0], cmdCounts[1], cmdCounts[4],
+                    cmdCounts[5], cmdCounts[6]);
+            for (int c = 2; c < 16; ++c)
+                if (c != 4 && c != 5 && c != 6 && cmdCounts[c])
+                    fprintf(stderr, " c%d=%u", c, cmdCounts[c]);
+            fprintf(stderr, "  clip=(%d,%d)-(%d,%d)\n",
+                    cameraProperties.x0, cameraProperties.y0,
+                    cameraProperties.x1, cameraProperties.y1);
+        }
     }
 }
 
@@ -1224,6 +1407,32 @@ void renderComposite(bgfx::ViewId outputView, u16 backScreenColor)
     };
     bgfx::setUniform(u_vdp2Regs0, regs0);
 
+    // Port diagnostic: VDP2 layer state as the composite sees it, once a second.
+    // Distinguishes "the engine thinks no layer is on" (game state / registers)
+    // from "layers are on but the render produces nothing" (our GL path).
+    {
+        static const bool traceRegs = getenv("PD_TRACE_VDP2") != nullptr;
+        if (traceRegs)
+        {
+            static u32 lastTick = 0;
+            const u32 now = SDL_GetTicks();
+            if (now - lastTick >= 1000)
+            {
+                lastTick = now;
+                fprintf(stderr,
+                        "[vdp2] BGON=0x%04x PRINA=0x%04x PRINB=0x%04x PRIR=0x%04x "
+                        "TVMD=0x%04x internal=%dx%d vdp1Targets=%d\n",
+                        (unsigned)vdp2Controls.m4_pendingVdp2Regs->m20_BGON,
+                        (unsigned)vdp2Controls.m4_pendingVdp2Regs->mF8_PRINA,
+                        (unsigned)vdp2Controls.m4_pendingVdp2Regs->mFA_PRINB,
+                        (unsigned)vdp2Controls.m4_pendingVdp2Regs->mFC_PRIR,
+                        (unsigned)vdp2Controls.m4_pendingVdp2Regs->m0_TVMD,
+                        internalResolution[0], internalResolution[1],
+                        bgfx::isValid(gBGFXVdp1PolyFB) ? 1 : 0);
+            }
+        }
+    }
+
     // VDP2 color calculation registers: CCCTL, CCRNA, SFCCMD, SFCODE
     // CCRNA/SFCODE are written per-frame to m20_registers by update tasks
     float regs1[4] = {
@@ -1352,10 +1561,43 @@ bool azelSdl_EndFrame()
     static bool BG3_GPU = true;
     static bool RBG0_GPU = false;
 
+    // Port diagnostic: report which VDP2 layer produced how many pixels, so a
+    // black field can be attributed to a layer instead of guessed at.
+    {
+        static const bool traceLayers = getenv("PD_TRACE_LAYERS") != nullptr;
+        if (traceLayers)
+        {
+            static u32 lastTick = 0;
+            const u32 now = SDL_GetTicks();
+            if (now - lastTick >= 1000)
+            {
+                lastTick = now;
+                fprintf(stderr,
+                        "[layers] BGON=0x%04x PRINA=0x%04x vdp2res=%dx%d useVDP1GL=%d "
+                        "BMPNA=0x%04x CHCTLA=0x%04x\n",
+                        (unsigned)vdp2Controls.m4_pendingVdp2Regs->m20_BGON,
+                        (unsigned)vdp2Controls.m4_pendingVdp2Regs->mF8_PRINA,
+                        vdp2ResolutionWidth, vdp2ResolutionHeight,
+                        useVDP1GL ? 1 : 0,
+                        (unsigned)vdp2Controls.m4_pendingVdp2Regs->m2C_BMPNA,
+                        (unsigned)vdp2Controls.m4_pendingVdp2Regs->m28_CHCTLA);
+            }
+        }
+    }
+
+    static const bool traceRender = getenv("PD_TRACE_FRAME") != nullptr;
+    struct timespec ra, rb, rc, rd, re;
+    if (traceRender) clock_gettime(CLOCK_MONOTONIC, &ra);
+
+    struct timespec b0, b1, b2, b3;
+    if (traceRender) clock_gettime(CLOCK_MONOTONIC, &b0);
     renderBG0(vdp2ResolutionWidth, vdp2ResolutionHeight, BG0_GPU);
+    if (traceRender) clock_gettime(CLOCK_MONOTONIC, &b1);
     renderBG1(vdp2ResolutionWidth, vdp2ResolutionHeight, BG1_GPU);
+    if (traceRender) clock_gettime(CLOCK_MONOTONIC, &b2);
     //renderBG2(vdp2ResolutionWidth, vdp2ResolutionHeight);
     renderBG3(vdp2ResolutionWidth, vdp2ResolutionHeight, BG3_GPU);
+    if (traceRender) clock_gettime(CLOCK_MONOTONIC, &b3);
     renderRBG0(vdp2ResolutionWidth, vdp2ResolutionHeight, RBG0_GPU);
 
     if(!isShipping())
@@ -1523,7 +1765,9 @@ bool azelSdl_EndFrame()
 
         if (useVDP1GL)
         {
+            if (traceRender) clock_gettime(CLOCK_MONOTONIC, &rb);
             renderVdp1ToGL(internalResolution[0], internalResolution[1]);
+            if (traceRender) clock_gettime(CLOCK_MONOTONIC, &rc);
         }
     }
     
@@ -1543,6 +1787,7 @@ bool azelSdl_EndFrame()
         // TODOL set the bgfx back color to this color
 
         renderComposite(CompositeView, backScreenColor);
+        if (traceRender) clock_gettime(CLOCK_MONOTONIC, &rd);
     }
 #endif
 
@@ -1721,6 +1966,31 @@ bool azelSdl_EndFrame()
     }
     
     bgfx::frame();
+
+    if (traceRender)
+    {
+        clock_gettime(CLOCK_MONOTONIC, &re);
+        static unsigned n = 0;
+        static double sBG = 0, sVdp1 = 0, sComp = 0, sFrame = 0;
+        auto ms = [](const struct timespec& x, const struct timespec& y) {
+            return (y.tv_sec - x.tv_sec) * 1000.0 + (y.tv_nsec - x.tv_nsec) / 1e6;
+        };
+        sBG += ms(ra, rb);
+        sVdp1 += ms(rb, rc);
+        sComp += ms(rc, rd);
+        sFrame += ms(rd, re);
+        static double sB0 = 0, sB1 = 0, sB3 = 0;
+        sB0 += ms(b0, b1); sB1 += ms(b1, b2); sB3 += ms(b2, b3);
+        if (++n % 30 == 0)
+        {
+            fprintf(stderr,
+                    "[render] vdp2=%.1fms (BG0=%.1f BG1=%.1f BG3=%.1f) vdp1=%.1fms "
+                    "composite=%.1fms frame=%.1fms\n",
+                    sBG / 30, sB0 / 30, sB1 / 30, sB3 / 30, sVdp1 / 30, sComp / 30,
+                    sFrame / 30);
+            sBG = sVdp1 = sComp = sFrame = sB0 = sB1 = sB3 = 0;
+        }
+    }
 
     {
         ZoneScopedN("WaitNextFrame");

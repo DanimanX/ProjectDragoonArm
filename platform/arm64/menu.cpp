@@ -18,6 +18,11 @@
 
 extern "C" void pdgles_set_pre_swap_hook(void (*fn)(void));
 
+// Read by the engine (see patches/README.md #5): while the menu is open the
+// game must not also consume the pad, otherwise the overlay behaves like a
+// transparent window instead of a pause screen.
+bool pdMenuOwnsInput = false;
+
 // provided by renderer_gles.cpp
 extern "C" int pdgles_window_width();
 extern "C" int pdgles_window_height();
@@ -36,6 +41,8 @@ namespace
 		float masterVolume = 1.0f;
 		bool showControls = false;
 		bool showAbout = false;
+		long openAfterMs = 0;
+		Uint64 openAt = 0;
 		double lastFps = 0.0;
 		Uint64 lastFrame = 0;
 		int framesSinceSample = 0;
@@ -52,11 +59,49 @@ namespace
 
 	Edge g_menuToggle, g_padToggle, g_quitCombo;
 
+	// One handle for the whole session. SDL_OpenGamepad takes a reference each
+	// call, and this used to run once per frame from three places — hundreds of
+	// references per minute, and it fights the engine, which opens the same pad
+	// for gameplay.
+	// The pad is read through evdev in the platform layer: SDL's joystick layer
+	// in this process delivers no events and reports frozen state, so every
+	// SDL_GetGamepadButton() here was permanently 0.
+	extern "C" unsigned pd_evdev_pad_mask(void);
+
+	unsigned padMask() { return pd_evdev_pad_mask(); }
+
+	SDL_Gamepad* pad()
+	{
+		static SDL_Gamepad* cached = nullptr;
+		static Uint64 lastTry = 0;
+		if (cached && SDL_GamepadConnected(cached)) return cached;
+		const Uint64 now = SDL_GetTicks();
+		if (now - lastTry < 1000) return cached;
+		lastTry = now;
+		int n = 0;
+		if (SDL_JoystickID* ids = SDL_GetGamepads(&n))
+		{
+			for (int i = 0; i < n; ++i)
+				if (SDL_Gamepad* gp = SDL_OpenGamepad(ids[i])) { cached = gp; break; }
+			SDL_free(ids);
+		}
+		return cached;
+	}
+
 	void drawMenu()
 	{
 		const ImGuiViewport* vp = ImGui::GetMainViewport();
 		const float w = vp->Size.x;
 		const float h = vp->Size.y;
+
+		// Dim the whole frame first. The game keeps running behind the overlay
+		// (it is a transparent window), and without this the moving picture reads
+		// as broken graphics behind the menu text.
+		ImDrawList* bg = ImGui::GetBackgroundDrawList();
+		// Opaque, not translucent: the game keeps rendering behind the overlay
+		// (movies play in their own small viewport), and anything less than
+		// opaque reads as graphical corruption behind the menu.
+		bg->AddRectFilled(ImVec2(0, 0), ImVec2(w, h), IM_COL32(0, 0, 0, 255));
 
 		ImGui::SetNextWindowPos(ImVec2(w * 0.5f, h * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
 		ImGui::SetNextWindowSize(ImVec2(w * 0.86f, 0.0f), ImGuiCond_Always);
@@ -132,6 +177,24 @@ namespace
 	}
 }
 
+	// Pad navigation for the overlay. Without this the menu is a dead window:
+	// it is drawn but nothing can be selected, and since the game's input is
+	// suspended while it is open the game cannot be driven either.
+	void feedPadNavMask(unsigned pm)
+	{
+		ImGuiIO& io = ImGui::GetIO();
+		io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+		io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+		io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+		io.AddKeyEvent(ImGuiKey_GamepadDpadUp,    (pm & 0x0010u) != 0);
+		io.AddKeyEvent(ImGuiKey_GamepadDpadDown,  (pm & 0x0020u) != 0);
+		io.AddKeyEvent(ImGuiKey_GamepadDpadLeft,  (pm & 0x0040u) != 0);
+		io.AddKeyEvent(ImGuiKey_GamepadDpadRight, (pm & 0x0080u) != 0);
+		io.AddKeyEvent(ImGuiKey_GamepadFaceDown,  (pm & 0x0001u) != 0);  // A
+		io.AddKeyEvent(ImGuiKey_GamepadFaceRight, (pm & 0x0002u) != 0);  // B
+	}
+
 // Called once per presented frame, immediately before the swap.
 extern "C" void pd_menu_frame(void)
 {
@@ -142,31 +205,45 @@ extern "C" void pd_menu_frame(void)
 		g_menu.lastFrame = SDL_GetTicks();
 		// PD_MENU_OPEN=1 starts with the menu visible (screenshots/CI)
 		if (const char* o = getenv("PD_MENU_OPEN")) g_menu.open = o[0] && o[0] != '0';
+		// PD_MENU_AFTER_MS=<n> opens the menu into a running game, which is how
+		// the mid-gameplay overlay state is reproduced deterministically.
+		if (const char* o = getenv("PD_MENU_AFTER_MS")) g_menu.openAfterMs = atol(o);
+		g_menu.openAt = SDL_GetTicks() + (Uint64)g_menu.openAfterMs;
 		if (const char* v = getenv("PD_FPS_OVERLAY")) g_menu.fpsOverlay = v[0] && v[0] != '0';
 	}
 
 	const bool* keys = SDL_GetKeyboardState(nullptr);
 	bool keyboardToggle = keys && (keys[SDL_SCANCODE_ESCAPE] || keys[SDL_SCANCODE_F1]);
 
-	bool padToggle = false, padQuit = false;
-	int numPads = 0;
-	if (SDL_JoystickID* pads = SDL_GetGamepads(&numPads))
+	const unsigned pm = padMask();
+	// Start+Select toggles; Select alone also opens (it is menu-only, so it
+	// never reaches the game with a meaning of its own).
+	const bool padStart = (pm & 0x0008u) != 0;
+	const bool padSelect = (pm & 0x10000u) != 0;
+	const bool padToggle = padStart && padSelect;
+	const bool padQuit = false;
+
+	if (g_menu.openAfterMs > 0 && !g_menu.open && SDL_GetTicks() >= g_menu.openAt)
 	{
-		for (int i = 0; i < numPads; ++i)
-		{
-			if (SDL_Gamepad* gp = SDL_OpenGamepad(pads[i]))
-			{
-				const bool start = SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_START);
-				const bool back = SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_BACK);
-				if (start && back) padToggle = true;
-				if (SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_GUIDE)) padQuit = true;
-			}
-		}
-		SDL_free(pads);
+		g_menu.open = true;
+		g_menu.openAfterMs = 0;
+		fprintf(stderr, "[menu] auto-opened at %llu ms\n", (unsigned long long)SDL_GetTicks());
 	}
 
-	if (g_menuToggle.pressed(keyboardToggle || padToggle))
+	// B (or Escape) always closes the menu: the overlay suspends game input, so
+	// there must be a way out that does not depend on any one button mapping.
+	const bool padBackEdge = (pm & 0x0002u) != 0;   // B closes the menu
+	static Edge backEdge;
+	const bool backPressed = backEdge.pressed(padBackEdge);
+
+	if (g_menuToggle.pressed(keyboardToggle || padToggle) ||
+	    (g_menu.open && (backPressed || (keys && keys[SDL_SCANCODE_ESCAPE]))))
+	{
 		g_menu.open = !g_menu.open;
+		fprintf(stderr, "[menu] %s\n", g_menu.open ? "opened (game input suspended)" : "closed");
+	}
+
+	pdMenuOwnsInput = g_menu.open;
 
 	// FPS accounting (the engine paces to 30 Hz; this shows the presented rate)
 	const Uint64 now = SDL_GetTicks();
@@ -182,6 +259,9 @@ extern "C" void pd_menu_frame(void)
 	// ImGui calls are compiled out there.
 	if (!g_menu.open && !g_menu.fpsOverlay) return;
 
+	if (g_menu.open)
+		feedPadNavMask(pm);
+
 	ImGuiIO& io = ImGui::GetIO();
 	io.DisplaySize = ImVec2((float)pdgles_window_width(), (float)pdgles_window_height());
 	ImGui_ImplOpenGL3_NewFrame();
@@ -195,8 +275,15 @@ extern "C" void pd_menu_frame(void)
 
 	if (g_menu.quitRequested || (padQuit && g_quitCombo.pressed(true)))
 	{
-		extern bool bContinue;
-		bContinue = false;
+		// Set the engine's own quit flag, NOT bContinue. This hook runs inside
+		// azelSdl_EndFrame(), and loopIteration() assigns `bContinue =
+		// azelSdl_EndFrame()` right after — so writing bContinue here was
+		// overwritten with true on the same frame and "Exit to Ports" did
+		// nothing. closeApp is what EndFrame returns !closeApp from, so it
+		// survives and the main loop breaks as intended.
+		extern bool closeApp;
+		closeApp = true;
+		fprintf(stderr, "[menu] exit requested\n");
 	}
 }
 
