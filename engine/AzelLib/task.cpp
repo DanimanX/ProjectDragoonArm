@@ -152,12 +152,70 @@ void processTasks(s_task** ppTask)
     }while (pTask);
 }
 
+// Port diagnostic (PD_TRACE_TASKGRAPH=1): dump the live task hierarchy once a
+// second. A stalled scene shows up as a task name that never changes, which is
+// the only way to tell "the game is waiting" from "the game is drawing the
+// wrong thing" without a debugger on the handheld.
+static void pdTraceTaskNode(s_task* t, int depth)
+{
+    for (; t; t = t->m0_pNextTask)
+    {
+        fprintf(stderr, "[graph]%*s%s%s\n", depth * 2, "", t->m_taskName ? t->m_taskName : "?",
+                t->isFinished() ? " (finished)" : "");
+        if (t->m4_pSubTask) pdTraceTaskNode(t->m4_pSubTask, depth + 1);
+    }
+}
+
+bool pdForceTaskGraphDump = false;
+
+static void pdMaybeTraceTaskGraph()
+{
+    static const bool on = getenv("PD_TRACE_TASKGRAPH") != nullptr;
+    if (!on) return;
+    static u32 last = 0;
+    const u32 now = SDL_GetTicks();
+    if (pdForceTaskGraphDump) { pdForceTaskGraphDump = false; last = now; }
+    else if (now - last < 1000) return;
+    else last = now;
+    fprintf(stderr, "[graph] --- active tasks ---\n");
+    pdTraceTaskNode(taskListHead, 0);
+
+    // The numbers that decide whether a scene can advance: the field task's
+    // state, the palette fade state, and the menu id. A screen that never
+    // changes is usually one of these pinned at the wrong value.
+    {
+        s_fieldTaskWorkArea* f = getFieldTaskPtr();
+        fprintf(stderr, "[state] fieldState=%d status=0x%04x field=%d sub=%d entry=%d fade0=%d fade1=%d 4C=%d 4D=%d menuId=%d tasks=%d\n",
+                f ? (int)f->m3C_fieldTaskState : -1,
+                f ? (unsigned)f->m28_status : 0u,
+                f ? (int)f->m2C_currentFieldIndex : -1,
+                f ? (int)f->m2E_currentSubFieldIndex : -1,
+                f ? (int)f->m30_fieldEntryPoint : -1,
+                (int)g_fadeControls.m0_fade0.m20_stopped,
+                (int)g_fadeControls.m24_fade1.m20_stopped,
+                (int)g_fadeControls.m_4C, (int)g_fadeControls.m_4D,
+                (int)graphicEngineStatus.m40AC.m0_menuId, numActiveTask);
+        // Open file handles. The menu graphics task refuses to open its menu
+        // until this list is empty, so a leaked handle blacks the screen out
+        // forever. Name them.
+        int open = 0;
+        for (sFileInfoSub* h = fileInfoStruct.m2C_allocatedHead; h; h = h->pNext)
+        {
+            if (open < 6) fprintf(stderr, "[file] open '%s' size=%u fh=%p\n",
+                                  h->m_fileName, h->m_fileSize, (void*)h->fHandle);
+            open++;
+        }
+        if (open) fprintf(stderr, "[file] %d open handle(s)\n", open);
+    }
+}
+
 void runTasks()
 {
     if (taskListHead)
     {
         processTasks(&taskListHead);
     }
+    pdMaybeTraceTaskGraph();
 }
 
 void resetTasks()

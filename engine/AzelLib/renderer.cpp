@@ -659,6 +659,9 @@ void azelSdl_StartFrame()
                 {
                     setButtons((u16)mask);
                     useGamepad = true;
+                    if (getenv("PD_TRACE_INPUT"))
+                        fprintf(stderr, "[fake] seq fire at=%u elapsed=%u mask=0x%x\n",
+                                atMs, elapsed, mask);
                 }
             }
         }
@@ -1824,7 +1827,11 @@ bool azelSdl_EndFrame()
 
         flushObjectsToDrawList();
 
-        if (useVDP1GL)
+        // PD_NO_VDP1=1 skips the VDP1 pass. With a VDP2 layer that is known to
+        // hold the right pixels still showing black, this says whether a VDP1
+        // primitive is covering it.
+        static const bool skipVdp1 = getenv("PD_NO_VDP1") != nullptr;
+        if (useVDP1GL && !skipVdp1)
         {
             if (traceRender && syncPasses) { pd_gpu_sync(); clock_gettime(CLOCK_MONOTONIC, &rb); }
     else if (traceRender) clock_gettime(CLOCK_MONOTONIC, &rb);
