@@ -54,25 +54,21 @@ but not proven. Last updated: 2026-11-24.
 
 ## Pending
 
-- **A VDP1 pass covers the VDP2 picture.** This is now the single visual
-  blocker, and it is why "the game is black" kept coming back after each
-  rendering fix. Measured on the device with the name-entry screen:
+- **The name-entry screen is black on the panel.** Narrower than it looked.
+  Measured with in-frame readbacks (`PD_DUMP_PANEL`, `PD_DUMP_TEX`) at
+  `fieldState=4`:
 
-  - With the VDP1 pass enabled the panel is solid black. With `PD_NO_VDP1=1`
-    the same frame renders correctly (letter grid, Back/Space/Enter buttons,
-    field task state 4, 33 live tasks).
-  - VDP1 issues only 6 commands in that frame (2 scaled sprites, user clip,
-    system clip, 2 local-coordinate commands), `clip=(0,0)-(352,224)`, so it
-    is not a volume problem: something in how its output is composited over
-    VDP2 is wrong.
-  - `VDP2_composite_ps.sc` decides with `vdp1Priority = floor(a*8-0.5)` and
-    gates on `vdp1Color.a > 0.1`; a sprite at priority 0 outranks every VDP2
-    layer at priority 0, so one full-panel sprite is enough to black out a
-    whole scene. The next step is to read back the VDP1 colour/priority
-    targets for that frame and check the alpha a cleared pixel actually has,
-    and what those two sprites cover.
-  - `PD_TRACE_VDP1=1` now dumps the command walk in draw order for frames with
-    8 or more commands, which is how the offending sprite gets named.
+  - the composite's output is black (`nonBlack 0.0%`), yet
+  - the NBG0 layer texture the composite samples is correct: read back from the
+    GPU it is the letter grid, 14% of pixels opaque, and
+  - decoding the same VRAM dump on the host with the same registers reproduces
+    the screen exactly, so the addressing model and the data agree.
+
+  So the layer renders, the composite runs over the whole panel (a uv-gradient
+  debug mode fills it), and the sample still comes back black. That points at
+  the five sampler bindings for that draw, not at VDP2 addressing. Next step is
+  `PDS_TRACE_TEX` on the composite's bind list (`s_vdp1Color`, `s_nbg0`,
+  `s_nbg1`, `s_nbg3`, `s_rbg0`) at that state.
 
 - **The field does not render yet.** This is the one that matters. Note that
   earlier field measurements were partly invalid: `PD_FAKE_MASK` could only
