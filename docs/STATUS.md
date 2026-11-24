@@ -79,36 +79,39 @@ but not proven. Last updated: 2026-11-24.
   | `bgfx::frame()` | 2 ms |
   | `StartFrame`, tasks, audio | 0.0 ms |
 
-  **Correction to an earlier reading of these numbers.** Per-phase CPU timers do
-  not attribute GPU cost, because GL commands are queued: the stall shows up
-  wherever the CPU first waits. An earlier profile therefore blamed BG0 in one
-  scene and VDP1 in another. Measuring properly — `glFinish()` at the top of the
-  frame, and between passes so each number is incremental — gives the real
-  picture on the title/movie scene:
+  **Two corrections, both earned by measuring again.**
 
-  | Pass | GPU time |
-  |---|---|
-  | previous frame drain | 47-73 ms |
-  | BG0 (352x224) | 13-15 ms |
-  | BG1 (352x224) | 8.6 ms |
-  | BG3 (352x224) | 7.4 ms |
-  | VDP1 | 30-65 ms |
-  | composite | 0.6 ms |
-  | every CPU-side phase | ~1-4 ms total |
+  First: per-phase CPU timers do not attribute GPU cost. GL commands are queued,
+  so a stall surfaces wherever the CPU first waits — an earlier profile blamed
+  BG0 in one scene and VDP1 in another for the same workload.
 
-  So it is not one pathological layer: **every pass is 30-100x slower than a
-  Mali-G31 should be**. 352x224 is 79 k pixels; 8.6 ms for one textured quad
-  works out at ~9 Mpixel/s against a part good for hundreds.
+  Second, and more important: after adding a real GPU drain (`glFinish` at the
+  top of the frame), the drain measures **0.4-0.7 ms even while the game runs at
+  7.4 fps**. So the GPU is idle; the field's 135 ms frame is CPU time, not GPU
+  time. Every claim that the field "starves the GPU" was wrong.
 
-  The suspect is the shader code itself. Our GLES layer compiles the engine's
-  embedded EGL blobs at runtime (`compileStage`), and it already has to rename
-  the integer `mod()` that bgfx emitted for VDP2 tile maths into `pd_mod`,
-  because GLSL ES has no integer `mod`. Integer division and modulo by uniform
-  divisors are among the slowest things Mali can be asked to do, and the tile
-  path performs dozens per pixel. Fixing it properly means passing shift/mask
-  pairs precomputed on the CPU and using `>>`/`&`, which needs the embedded
-  shaders regenerated — and there is no `shaderc` in the tree, only
-  `shaderc_prebuilt.cmake` that expects one.
+  What the timeline actually shows, walking into the field with synthetic input:
+
+  ```
+  fps:  29.9 29.9 29.7 29.8 14.9 14.9 14.9 14.8 7.4 7.8 29.7 7.4 7.5 29.9 ...
+  gpu:   0.4  0.5  0.5  0.5  0.7  0.7  0.7  0.7  0.6  0.7  0.6  0.6  0.6  0.6
+  ```
+
+  It alternates between 30 and 7.4 fps while the GPU stays idle, and `present`
+  reports `interval=134 ms` with `avg=0.21 ms`. So the frame is not spent
+  presenting and not spent on the GPU: it is spent somewhere in the per-frame
+  work that has not been accounted for yet.
+
+  The per-pass `[render]` numbers (BG0 13-15 ms, BG1 8.6 ms, BG3 7.4 ms, VDP1
+  30-65 ms) also sum to less than `EndFrame`, and they are CPU time in our GL
+  layer, not GPU waits. So the next thing to instrument is inside those passes:
+  something in them costs milliseconds of CPU for one quad each.
+
+  Also corrected: the compiled ESSL does **not** contain the integer div/mod
+  chain from the `.sc` sources — shaderc folded it to `/256` and `/255.0`. So
+  "integer division per pixel" is not the cause. The shader does contain 33
+  dependent `texelFetch` calls and no loops, which is worth understanding but is
+  not proven to be the cost.
 
 - The half-resolution A/B for BG0 was never successfully validated (early runs
   read a stale log), so "does the cost scale with pixel count" is still formally
