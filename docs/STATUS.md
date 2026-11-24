@@ -51,122 +51,41 @@ but not proven. Last updated: 2026-11-24.
 | 4 | Stale embedded shader table (ESSL/GLSL commented out) | no shader found for any GL backend |
 | 5 | Firmware has no SDL3 (Knulli ships SDL2 + a Mali fbdev EGL driver, no libdrm/libgbm) | `libSDL3.so.0: cannot open shared object file` at exec; no SDL video backend even if provided |
 | 6 | Transpiled VDP2 shaders declare every integer texture read `lowp int` | Mali implements `lowp int` as 16 bits, so a map base above `0x7FFF` truncated: NBG0's map at `0x10000` read `0`, and the layer drew the font instead of the tile map. Every tiled layer looked like glyph soup. Forcing `highp int` in `compileStage` fixed the title screen, the menus and all VDP2 text |
+| 7 | `bgfx::frame()` called `glBufferData(GL_ARRAY_BUFFER, 8 MB, NULL, GL_STREAM_DRAW)` without binding `g_transientVbo` first | The moment VDP1 drew its first sprite (creating `g_transientVbo`), `GL_ARRAY_BUFFER` still held `renderComposite`'s `quad_vertexbuffer`. Orphaning wiped the composite quad to 8 MB of uninitialized memory, turning the name-entry screen and field 100% black (`nonBlack 0.0%`) while `NBG0` stayed intact, and reallocated 8 MB every frame |
+| 8 | Transient draws in `submit()` ignored the ring offsets (`vboOff`, `iboOff`) and left stale vertex attributes enabled in shared VAOs | Every transient draw after the first in a frame drew chunk 0 instead of its own geometry; non-indexed transient draws (`rayDisplay`) were skipped |
+| 9 | VDP1 was upside-down relative to VDP2 in GLES (`originBottomLeft`) | `VDP2_ps` uses `gl_FragCoord.y` (Saturn row 0 at texture `v=0`), while `VDP1_*_vs` uses clip-space `+Y` up (row 0 at `v=1`). `VDP2_blit_vs` flips `v_texcoord0.y` for VDP2, which inverted VDP1. Flipping `s_vdp1Color` V in `VDP2_composite_ps` aligned 2D cursors and 3D models with VDP2 |
+| 10 | `BGFX_STATE_CULL_CW` / `BGFX_STATE_CULL_CCW` had `GL_CW` and `GL_CCW` swapped | `BGFX_STATE_CULL_CCW` culled all front-facing 3D geometry and drew only back faces, hiding ~96% of the 3D excavation chamber (`nonBlack 3.4%` -> `57.6%` after fix) |
+| 11 | `BGFX_STATE_BLEND_FUNC` packed `_dst` into the low 32 bits (colliding with write/depth/cull flags) while `submit()` read bits 40..44 | Opaque `BGFX_STATE_BLEND_FUNC(ONE, ZERO)` 3D draws read `dst=0` (`GL_ONE`) and ran as additive blending (`GL_ONE, GL_ONE`). Repacked blend factors into bits 32..39 |
+| 12 | `bgfx::copy()` / `makeRef()` never freed their allocations; `VDP1_ps` transpiled `RGBA32F` corner fetches and inverse-bilinear solver as `lowp` | Leaked ~10+ MB/sec in 3D gameplay from per-object `ndcCornersTex`; `lowp` FP16 math in `VDP1_ps` breaks UVs on Mali-G31. Freed `bgfx::Memory` on consumption, forced `highp` in `VDP1_ps`, and forced `GL_NEAREST` on `GL_FLOAT` textures |
+| 13 | Unnecessary per-frame GPU/CPU bandwidth in the VDP1/VDP2 path | Dropped dead 512 KB/frame `bgfx_vdp1_ram_texture` upload (never sampled), dirty-checked 512 KB VDP2 VRAM/CRAM uploads, removed unused `vdp1PriorityTexture` 720x540 MRT attachment from `gBGFXVdp1PolyFB`, skipped unused 315 KB `vdp1TextureOutput` memset under `useVDP1GL`, and shrunk transient buffers from 10 MB to 1.25 MB (orphaned only when used) |
 
 ## Pending
 
-- **The name-entry screen is black on the panel.** Narrower than it looked.
-  Measured with in-frame readbacks (`PD_DUMP_PANEL`, `PD_DUMP_TEX`) at
-  `fieldState=4`:
+- **Re-verify the fixed name-entry screen, 3D field and frame rate on the RG34XX.**
+  All of the rendering blockers below have been fixed and verified on the x86_64
+  GLES 3.2 host build (clean boot through SEGA logo -> intro movie -> title ->
+  NEW GAME -> name-entry screen with aligned VDP1 cursors (`nonBlack 22.2%`,
+  `docs/images/name-entry.png`) -> second cinematic -> playable 3D Excavation
+  Site #4 corridor (`nonBlack 57.6%`, `docs/images/field-3d.png`) and camp menu
+  (`nonBlack 90.5%`), plus `shim_smoketest` 76,800/76,800 PASS). Needs device
+  confirmation on the RG34XX (Mali-G31) for visual correctness and post-fix
+  field frame rate (the earlier 9.9 fps / 30-65 ms VDP1 profile ran with the
+  8 MB/frame VBO reallocation bug, dead 512 KB VDP1 RAM upload, unconditional
+  512 KB VDP2 VRAM upload, and unused 720x540 MRT priority target).
 
-  - the composite's output is black (`nonBlack 0.0%`), yet
-  - the NBG0 layer texture the composite samples is correct: read back from the
-    GPU it is the letter grid, 14% of pixels opaque, and
-  - decoding the same VRAM dump on the host with the same registers reproduces
-    the screen exactly, so the addressing model and the data agree.
+- **CPK movie bottom strip.** In the second cinematic (`fieldState=7`), the
+  320x176 movie renders coherently above a ~24 px unclipped strip at the bottom
+  edge of the 352x224 layer (`WPSY0=24, WPEY0=199`). Minor visual polish; does
+  not block gameplay.
 
-  So the layer renders, the composite runs over the whole panel (a uv-gradient
-  debug mode fills it), and the sample still comes back black. That points at
-  the five sampler bindings for that draw, not at VDP2 addressing. Next step is
-  `PDS_TRACE_TEX` on the composite's bind list (`s_vdp1Color`, `s_nbg0`,
-  `s_nbg1`, `s_nbg3`, `s_rbg0`) at that state.
-
-- **The field does not render yet.** This is the one that matters. Note that
-  earlier field measurements were partly invalid: `PD_FAKE_MASK` could only
-  repeat one button, so it navigated into the *save menu* (visible in the task
-  traces as `LoadSavegameScreen`, `saveMenuSubTask0`) rather than into the field.
-  `PD_FAKE_SEQ` now scripts a press sequence for reproducible navigation.
-  Current state of that investigation, all measured with `PD_TRACE_LAYERS`:
-
-  - The movie case is fixed (see the CPK row above). But the layer *stays* in
-    that 16.7M bitmap mode after the movie closes (`CHCTLA=0x0044` with the
-    handle already null), so the base fell back to `MPOFN`'s bank 0 — the font.
-    The last movie base is now remembered and reused while `CHCN==4`.
-  - The save/load menu renders garbage tiles. Its state is `BGON=0x000b`,
-    `CHCTLA=0x0011` (tile mode, 256 colours, 16x16 chars), `PNCN0=0xc000`,
-    `MPABN0=0x2120`, `PLSZ=0x0000`.
-  - Writer and reader agree on addressing: `setVdp2MapOffset` for NBG3 computes
-    A=0x6000 with shift=13 and the reader derives 0x6000; for NBG0 both derive
-    0x10000. So the plane-offset maths is not the bug.
-  - VRAM at 0x10000 is **entirely zero** while 0x00000..0x00800 is 76%
-    non-zero, i.e. the layer reads a region the game never filled.
-  - The cause turned out to be in the shader, found by comparing our decompiled
-    ESSL with Lagi's independent VDP2 implementation
-    (`Lagi/shaders/vdp2_nbg_f.cg`). Two defects, both of which Lagi documents as
-    producing *cyan/teal corruption* — the exact colour of this port's garbage:
-    1. `characterOffset = characterNumber` with no `* 32`. A Saturn character
-       number is in 32-byte units, so every pattern was read 32x too low.
-    2. 256-colour mode applied the 4bpp pattern palette number
-       (`(paletteNumber << 4) + dotColor`). In CHCN=1 the 8-bit dot is already
-       the palette index; the shift selects unrelated CRAM banks.
-    Both are corrected in `compileStage` in `platform/arm64/bgfx/bgfx_gles.cpp`,
-    loudly (a pattern that stops matching prints a warning rather than silently
-    doing nothing). Verified that the patched shader still compiles and links
-    (host build: `program VDP2_vs/VDP2_ps -> handle 10240`), but **not yet
-    verified on the panel**.
-
-  Recorded observations, still to be re-taken on a real playthrough:
-  - The engine does advance: it creates the field tasks (`BattleManager`,
-    `fieldDebugTaskWorkArea`), VDP1 command count grows from 4 to 23, and the
-    movie state machine completes.
-  - But a captured frame shows **text glyphs drawn as graphics**, the signature
-    of a layer reading VRAM at the wrong address, and the movie's NBG0 bitmap
-    layer is the prime suspect: `setNBG0MapOffset(0, 0x25E00000)` leaves the map
-    offset at zero while the decoder writes frames at `0x25E14040`.
-  - The *first* cinematic renders correctly and the *second* does not, with the
-    same window registers (`w=320 h=176`, `WPSX0=32 WPSY0=24 WPEX0=670
-    WPEY0=399`), so something differs between the two that has not been isolated
-    yet.
-- **Frame rate collapses to ~1 fps once the field is entered.** Profiled by
-  phase on the device rather than guessed:
-
-  | Phase | Cost |
-  |---|---|
-  | `EndFrame` (render + present) | 51-71 ms |
-  | `present` (eglSwapBuffers) | 0.7 ms |
-  | `vdp2` layers (BG0/BG1/BG3) | 26-63 ms |
-  | `vdp1` | 0.2 ms |
-  | composite | 0.2 ms |
-  | `bgfx::frame()` | 2 ms |
-  | `StartFrame`, tasks, audio | 0.0 ms |
-
-  **Settled, after two wrong turns worth recording.**
-
-  Wrong turn 1: per-pass CPU timers cannot attribute GPU cost, because GL
-  commands queue — the stall appears wherever the CPU first waits. That made one
-  profile blame BG0 and the next blame VDP1 for identical work.
-
-  Wrong turn 2: adding a GPU drain *between* passes, and then reading the
-  frame-start drain, made the GPU look idle (0.6 ms) while the game ran at
-  7.4 fps. The drains had already emptied the queue. `PD_SYNC_PASSES` now gates
-  them, so the two kinds of measurement cannot contaminate each other.
-
-  Clean numbers, no inter-pass syncs, field reached with synthetic input:
-
-  | Measurement | Value |
-  |---|---|
-  | CPU to issue a whole frame (vdp2+vdp1+composite+bgfx::frame) | ~4 ms |
-  | GPU work per frame (frame-start `glFinish` drain) | 47-73 ms |
-  | Frame interval at the low points | ~101 ms (9.9 fps) |
-
-  **So the field is GPU-bound, and the CPU side is not the problem.**
-
-  With `PD_SYNC_PASSES=1` (per-pass GPU cost, accepting that it serialises):
-  BG0 13-15 ms, BG1 8.6 ms, BG3 7.4 ms, VDP1 30-65 ms, composite 0.6 ms.
-
-  And the decisive experiment: rendering BG0 at **half resolution** lowered BG0
-  to 4-7 ms *and also* BG1 to 2.5 ms and BG3 to 2.1 ms. One layer using fewer
-  pixels sped up the others, which is the signature of shared **memory
-  bandwidth**, not shader ALU. That also retires the earlier "integer division
-  per pixel" theory: the compiled ESSL has no such chain (shaderc folded it to
-  /256 and /255.0).
-
-  Open: VDP1 is the largest single consumer (30-65 ms) while submitting only
-  4-6 commands per frame, so its cost is fixed per-frame work, not command
-  volume. Finding what that is — most likely a full-panel clear/draw or a
-  full-size texture touched every frame — is the next step.
-
-- The half-resolution A/B for BG0 did run cleanly in the end, and its result
-  (halving one layer sped up the others) is what points at bandwidth.
+- **Earlier field-performance notes (pre-fix baseline, to re-measure on device):**
+  With `PD_SYNC_PASSES=1` before fixes #7–#13: BG0 13-15 ms, BG1 8.6 ms, BG3
+  7.4 ms, VDP1 30-65 ms, composite 0.6 ms; total GPU drain 47-73 ms (~9.9 fps).
+  Halving BG0 lowered BG0 (4-7 ms), BG1 (2.5 ms) and BG3 (2.1 ms) together,
+  confirming shared memory bandwidth as the bottleneck on Mali-G31. Re-measure
+  on the RG34XX with the rebuilt ARM64 binary; if 3D field GPU time still
+  exceeds 33 ms, lowering VDP1 `internalResolution` (e.g. half-scale option) is
+  the next lever.
 
 - Disc swap. All four discs are deployed; only Disc 1 has been exercised.
 - In-game audio balance and whether the mixer restore interferes with anything
