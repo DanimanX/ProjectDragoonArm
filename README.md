@@ -78,21 +78,40 @@ is a real requirement, not a preference. See `docs/PORTING-NOTES.md`.
 
 ## Status
 
-**It runs.** Verified on x86_64 with a real GLES 3.2 context: the port boots the
-game, presents the SEGA logo and the *AZEL* title card, holds 30.3 FPS, and the
-in-game menu opens over the running game. The ARM64 build produces a 4.5 MB
-binary needing `libGLESv2.so.2`, `libc`, `libm`, `libpthread` and `libdl` from
-the firmware, plus a `libSDL3.so.0` that the package carries itself, with a
-maximum symbol version of `GLIBC_2.27`.
+**It runs on real hardware at full speed (30.0 FPS).** Verified on both x86_64
+and the **Anbernic RG34XX** (Allwinner H700, Mali-G31 MP2, Knulli): the port
+boots Disc 1 through the SEGA logo, *AZEL* title card, CPK cinematics,
+name-entry screen, and 3D gameplay (Excavation Site #4) with physical D-pad
+movement, audio through the internal speaker, and the in-game menu. The ARM64
+build produces a 4.6 MB stripped binary needing `libGLESv2.so.2`, `libc`,
+`libm`, `libpthread` and `libdl` from the firmware, plus a bundled
+`libSDL3.so.0` (`GLIBC_2.27` max symbol version).
+
+### Tested Devices (Real Hardware)
+
+Measured on retail handhelds with the PortMaster `aarch64` build. The native Sega Saturn frame rate is `30.0 FPS` (100% speed).
+
+| Device | SoC | GPU | GPU module (GLES driver) | OS / CFW | Tested performance |
+|---|---|---|---|---|---|
+| **Anbernic RG34XX** | Allwinner H700 (4× Cortex-A53 @ 1.5–1.7 GHz) | ARM Mali-G31 MP2 (696 MHz) | `libmali.so` (ARM Bifrost userspace blob, GLES 3.2 `r20p0`) + `mali_kbase` kernel module | **Knulli** ("scarab 2026/05/11") | **30.0 FPS — full speed** (intro, CPK movies, name entry, 3D field `~6.4 ms` active work/frame) |
+
+### Compatible Handhelds
+
+Compiled for **`aarch64-linux-gnu` / `glibc <= 2.28`** (requiring **OpenGL ES 3.0+** for integer VDP2 textures):
+- **Anbernic XX (Allwinner H700):** RG34XX *(verified)*, RG35XX Plus / H / SP / 2024, RG40XX H / V, RG CubeXX, RG28XX (Knulli, muOS, ROCKNIX, Stock OS)
+- **Rockchip RK3566 (Cortex-A55 @ 1.8 GHz, Mali-G52):** Powkiddy RGB30 / X55, Anbernic RG353 / RG503, Miyoo Flip *(untested)*
+- **Allwinner A133P / TrimUI (PowerVR GE8300, GLES 3.2):** TrimUI Smart Pro, TrimUI Brick *(untested)*
+- **ARM64 SBCs:** Raspberry Pi 4 / 5, Orange Pi Zero 2W / 3 (64-bit Linux, GLES 3.x) *(untested)*
 
 | Verified | Evidence |
 |---|---|
 | Disc pipeline | 1,695 files / 534 MiB from the supplied `.7z` in 7.7 s, 14/14 PRGs matching atolm's sha256 manifest |
 | Engine builds for AArch64 | all translation units, `zig c++ -target aarch64-linux-gnu.2.28 -mcpu=cortex_a53` |
-| Rendering | `SEGA ENTERPRISES, LTD.` then `AZEL` title card, captured from the GL back buffer |
-| Frame rate | 30.3 FPS in the menu overlay (engine paces to the Saturn's 30 Hz) |
+| Rendering on RG34XX | SEGA logo, *AZEL* title, CPK cinematics, name-entry screen, and 3D Excavation Site #4 captured directly on device |
+| Frame rate on RG34XX | **30.0 FPS locked** (`~6.4 ms` active work/frame in 3D field at 696 MHz Mali-G31, `0.1 ms` UI sprites) |
+| Audio & controls on RG34XX | PipeWire/ALSA speaker output (unmutes `SPK Switch` and restores on exit); direct evdev D-pad + buttons |
 | In-game menu | opens over gameplay; display mode, master volume, controls, about, exit |
-| ARM64 package | `dist/PanzerDragoonArm-PortMaster-aarch64.zip`, 1.9 MB |
+| ARM64 package | `dist/PanzerDragoonArm-PortMaster-aarch64.zip`, 4.6 MB (includes bundled `libSDL3.so.0`) |
 | Self-check | `shim_smoketest` renders 76,800/76,800 pixels through the GLES layer |
 
 **SDL3 is not a firmware library on the H700.** Knulli/Batocera ship SDL2 — with
@@ -100,36 +119,32 @@ a home-grown "Mali EGL" fbdev video driver — and no `libSDL3`, `libdrm` or
 `libgbm`. The package therefore bundles an SDL3 built for AArch64/glibc 2.28
 (`tools/build-sdl3-arm64.sh`: video `dummy`/`offscreen`, audio ALSA loaded
 dynamically, joystick evdev) and the port takes its GLES context straight from
-libmali's EGL over `/dev/fb0`, installing its own buffer swap. See
-`platform/arm64/renderer_gles.cpp`.
+libmali's EGL over `/dev/fb0` (Mali `fbdev_window`), rendering into an offscreen
+FBO and presenting via `eglSwapBuffers` synced to `FBIO_WAITFORVSYNC` with no
+CPU readback. See `platform/arm64/renderer_gles.cpp`.
 
-**It runs on the handheld.** On 2026-11-23 the port booted on an RG34XX
-(Knulli "scarab 2026/05/11"): GLES `3.2 v1.r20p0-01rel0` on Mali-G31, the SEGA
-logo and the opening scene captured directly from `/dev/fb0`.
-
-The three things that had to be measured rather than assumed, all of them on
-the device:
+Key hardware findings measured directly on the RG34XX:
 
 - **EGL configs here have `surface_type == 0`.** Passing `EGL_SURFACE_TYPE`
   makes `eglChooseConfig` fail with `EGL_BAD_ATTRIBUTE`; ask only for a
-  renderable type and depth, then create the window surface with a `NULL`
-  native handle.
-- **`eglSwapBuffers` lies on this libmali.** It returns `EGL_TRUE` and nothing
-  ever reaches the panel. The port publishes by reading the frame back and
-  writing it to the off-screen `/dev/fb0` page, then flipping.
+  renderable type and depth, then create the window surface over a Mali
+  `fbdev_window`.
 - **The engine needs an SDL window even when it renders elsewhere.**
   `renderer.cpp` reads `SDL_GetWindowSize()`, so with no window the resolution
   stays 0 and the composite draws nothing. SDL3's hint is `SDL_VIDEO_DRIVER`
   (SDL2's `SDL_VIDEODRIVER` is ignored); the `offscreen` driver provides the
   window object without GL, which is all that is needed.
-
 - **The codec boots with the speaker muted.** `SPK Switch` is off on this
   firmware while the DAC mixers are on, so a perfectly good audio stream is
   inaudible. The launcher turns it on for the session and restores the original
   value on exit.
+- **Mali devfreq only exposes `simple_ondemand`.** Writing `performance` to
+  `governor` fails silently and leaves the GPU at 240–420 MHz. The launcher
+  raises `/sys/class/devfreq/gpu/min_freq` to `696000000` (696 MHz) for the
+  session and restores it on exit.
 
-Still unmeasured: frame rate on the H700, disc swap, and physical controller
-input — see [docs/STATUS.md](docs/STATUS.md).
+Still unverified on device: disc swap (all 4 discs are extracted/deployed) and
+save/load persistence — see [docs/STATUS.md](docs/STATUS.md).
 
 [docs/STATUS.md](docs/STATUS.md) keeps the full ledger, including what is known
 to be incomplete *in the engine itself* (upstream Azel is playable through the
