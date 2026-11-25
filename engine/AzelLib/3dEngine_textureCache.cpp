@@ -366,6 +366,7 @@ bgfx::TextureHandle getTextureForQuadBGFX(s_quad& quad)
 
     if (!textureWidth || !textureHeight)
     {
+        delete[] (unsigned char*)textureOutput;
         return BGFX_INVALID_HANDLE;
     }
     const uint64_t tsFlags = 0
@@ -374,6 +375,7 @@ bgfx::TextureHandle getTextureForQuadBGFX(s_quad& quad)
         ;
 
     newTexture.m_handle = bgfx::createTexture2D(textureWidth, textureHeight, false, 1, bgfx::TextureFormat::RGBA8, tsFlags, bgfx::copy(textureOutput, textureWidth * textureHeight * 4));
+    delete[] (unsigned char*)textureOutput;
 
     textureCache[textureHash] = newTexture;
 

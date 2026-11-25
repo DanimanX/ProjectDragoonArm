@@ -662,10 +662,9 @@ void azelSdl_StartFrame()
     // (0x0008 = Start); it pulses every PD_FAKE_PERIOD_MS for PD_FAKE_HOLD_MS
     // starting at PD_FAKE_AT_MS, which is enough to walk the title menu.
     {
-        // PD_FAKE_SEQ="1200:8,9000:1,14000:1" scripts a press sequence:
-        // <at_ms>:<hex mask> pairs, each held 250 ms. The single-mask hook above
-        // could only repeat one button, which walked into the save menu instead
-        // of into the field and made earlier field measurements meaningless.
+        // PD_FAKE_SEQ="1200:8,9000:1,46000:10:6000" scripts a press sequence:
+        // <at_ms>:<hex mask>[:<hold_ms>] entries (default hold 250 ms). Uses
+        // digital controller mode (useGamepad=false) so D-pad walks in 3D.
         static const char* fakeSeqEnv = getenv("PD_FAKE_SEQ");
         if (fakeSeqEnv)
         {
@@ -678,14 +677,17 @@ void azelSdl_StartFrame()
                 const u32 atMs = (u32)strtoul(q, (char**)&q, 10);
                 if (*q != ':') break;
                 const u32 mask = (u32)strtoul(q + 1, (char**)&q, 16);
+                u32 holdMs = 250;
+                if (*q == ':')
+                    holdMs = (u32)strtoul(q + 1, (char**)&q, 10);
                 if (*q == ',') ++q;
-                if (elapsed >= atMs && elapsed < atMs + 250)
+                if (elapsed >= atMs && elapsed < atMs + holdMs)
                 {
                     setButtons((u16)mask);
-                    useGamepad = true;
+                    useGamepad = false;
                     if (getenv("PD_TRACE_INPUT"))
-                        fprintf(stderr, "[fake] seq fire at=%u elapsed=%u mask=0x%x\n",
-                                atMs, elapsed, mask);
+                        fprintf(stderr, "[fake] seq fire at=%u elapsed=%u mask=0x%x hold=%u\n",
+                                atMs, elapsed, mask, holdMs);
                 }
             }
         }
@@ -1582,9 +1584,22 @@ void renderComposite(bgfx::ViewId outputView, u16 backScreenColor)
 }
 
 extern "C" void pd_gpu_sync(void);
+extern unsigned g_perfObj3dCount;
+extern unsigned g_perfObj3dQuads;
+
+static double pdNowMs()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
 
 bool azelSdl_EndFrame()
 {
+    static const bool tracePerf = getenv("PD_TRACE_PERF") != nullptr;
+    static double perfPrevEndMs = 0.0;
+    const double perfStartMs = tracePerf ? pdNowMs() : 0.0;
+    const double perfTasksMs = (tracePerf && perfPrevEndMs > 0.0) ? (perfStartMs - perfPrevEndMs) : 0.0;
     // Measure how long the previous frame's GPU work takes to drain. Per-phase
     // CPU timers cannot attribute GPU cost (commands are queued), which is how an
     // earlier profile blamed BG0 in one scene and VDP1 in another.
@@ -1693,19 +1708,28 @@ bool azelSdl_EndFrame()
             }
             else if (memcmp(lastVdp2Ram.data(), curVdp2Ram, 0x80000) != 0)
             {
-                // Upload only the dirty row span [minRow..maxRow] instead of
-                // the full 512 KB every frame (cuts movie & subtitle upload cost).
+                // Upload only dirty contiguous 16-row (4 KB) runs so two small
+                // updates at opposite ends of VRAM do not re-upload 450+ KB.
                 constexpr int kRows = 0x80000 / 256;
-                int minRow = 0;
-                while (minRow < kRows && memcmp(lastVdp2Ram.data() + minRow * 256, curVdp2Ram + minRow * 256, 256) == 0)
-                    ++minRow;
-                int maxRow = kRows - 1;
-                while (maxRow > minRow && memcmp(lastVdp2Ram.data() + maxRow * 256, curVdp2Ram + maxRow * 256, 256) == 0)
-                    --maxRow;
-                const int span = maxRow - minRow + 1;
-                memcpy(lastVdp2Ram.data() + minRow * 256, curVdp2Ram + minRow * 256, (size_t)span * 256);
-                bgfx::updateTexture2D(bgfx_vdp2_ram_texture, 0, 0, 0, (uint16_t)minRow, 256, (uint16_t)span,
-                                      bgfx::makeRef(curVdp2Ram + minRow * 256, (uint32_t)(span * 256)));
+                constexpr int kBlockRows = 16;
+                constexpr int kBlockBytes = kBlockRows * 256;
+                int row = 0;
+                while (row < kRows)
+                {
+                    if (memcmp(lastVdp2Ram.data() + row * 256, curVdp2Ram + row * 256, kBlockBytes) == 0)
+                    {
+                        row += kBlockRows;
+                        continue;
+                    }
+                    int runStart = row;
+                    row += kBlockRows;
+                    while (row < kRows && memcmp(lastVdp2Ram.data() + row * 256, curVdp2Ram + row * 256, kBlockBytes) != 0)
+                        row += kBlockRows;
+                    const int span = row - runStart;
+                    memcpy(lastVdp2Ram.data() + runStart * 256, curVdp2Ram + runStart * 256, (size_t)span * 256);
+                    bgfx::updateTexture2D(bgfx_vdp2_ram_texture, 0, 0, 0, (uint16_t)runStart, 256, (uint16_t)span,
+                                          bgfx::makeRef(curVdp2Ram + runStart * 256, (uint32_t)(span * 256)));
+                }
                 ++g_vdp2ContentGen;
             }
             if (lastVdp2Cram.size() != 0x1000 || memcmp(lastVdp2Cram.data(), curVdp2Cram, 0x1000) != 0)
@@ -1755,6 +1779,8 @@ bool azelSdl_EndFrame()
     struct timespec ra, rb, rc, rd, re;
     if (traceRender) clock_gettime(CLOCK_MONOTONIC, &ra);
 
+    const double perfAfterVramMs = tracePerf ? pdNowMs() : 0.0;
+
     struct timespec b0, b1, b2, b3;
     if (traceRender) clock_gettime(CLOCK_MONOTONIC, &b0);
     renderBG0(vdp2ResolutionWidth, vdp2ResolutionHeight, BG0_GPU);
@@ -1767,7 +1793,9 @@ bool azelSdl_EndFrame()
     renderBG3(vdp2ResolutionWidth, vdp2ResolutionHeight, BG3_GPU);
     if (traceRender && syncPasses) { pd_gpu_sync(); clock_gettime(CLOCK_MONOTONIC, &b3); }
     else if (traceRender) clock_gettime(CLOCK_MONOTONIC, &b3);
+    const double perfBeforeRbg0Ms = tracePerf ? pdNowMs() : 0.0;
     renderRBG0(vdp2ResolutionWidth, vdp2ResolutionHeight, RBG0_GPU);
+    const double perfAfterRbg0Ms = tracePerf ? pdNowMs() : 0.0;
 
     if(!isShipping())
     {
@@ -1914,6 +1942,7 @@ bool azelSdl_EndFrame()
         }
     }
 
+    double perfBeforeObj3dMs = 0.0, perfAfterObj3dMs = 0.0, perfAfterVdp1_2dMs = 0.0;
     // render VDP1 frame buffer
     if(1)
     {
@@ -1930,7 +1959,9 @@ bool azelSdl_EndFrame()
 
         bgfx::setViewMode(vdp1_gpuView, bgfx::ViewMode::Sequential);
 
+        perfBeforeObj3dMs = tracePerf ? pdNowMs() : 0.0;
         flushObjectsToDrawList();
+        perfAfterObj3dMs = tracePerf ? pdNowMs() : 0.0;
 
         // PD_NO_VDP1=1 skips the VDP1 pass. With a VDP2 layer that is known to
         // hold the right pixels still showing black, this says whether a VDP1
@@ -1944,6 +1975,7 @@ bool azelSdl_EndFrame()
             if (traceRender && syncPasses) { pd_gpu_sync(); clock_gettime(CLOCK_MONOTONIC, &rc); }
             else if (traceRender) clock_gettime(CLOCK_MONOTONIC, &rc);
         }
+        perfAfterVdp1_2dMs = tracePerf ? pdNowMs() : 0.0;
     }
     
     //Compose
@@ -2177,7 +2209,50 @@ bool azelSdl_EndFrame()
         //renderTexturedQuadBgfx(0, bgfx::getTexture(gBgfxCompositedFB));
     }
     
+    const double perfBeforeFrameMs = tracePerf ? pdNowMs() : 0.0;
     bgfx::frame();
+    const double perfAfterFrameMs = tracePerf ? pdNowMs() : 0.0;
+
+    if (tracePerf)
+    {
+        static unsigned pN = 0;
+        static double sTasks = 0, sVram = 0, sBg = 0, sRbg0 = 0, sObj3d = 0, sVdp12d = 0, sComp = 0, sFrame = 0;
+        static unsigned sObjs = 0, sQuads = 0;
+        static double winStartMs = perfAfterFrameMs;
+        sTasks  += perfTasksMs;
+        sVram   += (perfAfterVramMs - perfStartMs);
+        sBg     += (perfBeforeRbg0Ms - perfAfterVramMs);
+        sRbg0   += (perfAfterRbg0Ms - perfBeforeRbg0Ms);
+        sObj3d  += (perfAfterObj3dMs - perfBeforeObj3dMs);
+        sVdp12d += (perfAfterVdp1_2dMs - perfAfterObj3dMs);
+        sComp   += (perfBeforeFrameMs - perfAfterVdp1_2dMs);
+        sFrame  += (perfAfterFrameMs - perfBeforeFrameMs);
+        sObjs   += g_perfObj3dCount;
+        sQuads  += g_perfObj3dQuads;
+        g_perfObj3dCount = 0;
+        g_perfObj3dQuads = 0;
+        if (++pN % 30 == 0)
+        {
+            const double wallMs = perfAfterFrameMs - winStartMs;
+            winStartMs = perfAfterFrameMs;
+            unsigned long gpuMhz = 0;
+            if (FILE* gf = fopen("/sys/class/devfreq/gpu/cur_freq", "r"))
+            {
+                if (fscanf(gf, "%lu", &gpuMhz) == 1) gpuMhz /= 1000000UL;
+                fclose(gf);
+            }
+            fprintf(stderr,
+                    "[perf] %.1f fps (%.1fms) tasks=%.1f vram=%.1f bg=%.1f rbg0=%.1f "
+                    "obj3d=%.1f(%u/%uq) v1_2d=%.1f comp=%.1f swap=%.1f BGON=0x%04x gpu=%luMHz\n",
+                    30000.0 / (wallMs > 0.001 ? wallMs : 1.0), wallMs / 30.0,
+                    sTasks / 30.0, sVram / 30.0, sBg / 30.0, sRbg0 / 30.0,
+                    sObj3d / 30.0, sObjs / 30, sQuads / 30,
+                    sVdp12d / 30.0, sComp / 30.0, sFrame / 30.0,
+                    (unsigned)vdp2Controls.m4_pendingVdp2Regs->m20_BGON, gpuMhz);
+            sTasks = sVram = sBg = sRbg0 = sObj3d = sVdp12d = sComp = sFrame = 0;
+            sObjs = sQuads = 0;
+        }
+    }
 
     if (traceRender)
     {
@@ -2242,6 +2317,7 @@ bool azelSdl_EndFrame()
                 next_target = now;
             }
         }
+        if (tracePerf) perfPrevEndMs = pdNowMs();
     }
 #endif
 

@@ -376,9 +376,14 @@ glm::mat4 MatrixToGLM(const sMatrix4x3& inputMatrix)
     return tempObjectMatrix;
 }
 
+unsigned g_perfObj3dCount = 0;
+unsigned g_perfObj3dQuads = 0;
+
 void drawObject(s_objectToRender* pObject, const glm::mat4& projectionMatrix)
 {
     pObject->m_pObject->generateVertexBuffer();
+    g_perfObj3dCount++;
+    g_perfObj3dQuads += (unsigned)pObject->m_pObject->mC_Quads.size();
 
     static bgfx::ProgramHandle vdp1_program = BGFX_INVALID_HANDLE;
     static bgfx::UniformHandle vdp1_modelViewProj = BGFX_INVALID_HANDLE;
@@ -405,25 +410,12 @@ void drawObject(s_objectToRender* pObject, const glm::mat4& projectionMatrix)
     offsetMatrix[3][0] = pObject->m_2dOffset[0] * 2.0f; // NDC range is -1 to 1
     offsetMatrix[3][1] = -pObject->m_2dOffset[1] * 2.0f;
     glm::mat4 mvpMatrix = offsetMatrix * projectionMatrix * MatrixToGLM(pObject->m_modelMatrix);
-    glm::mat4 invMvpMatrix = glm::inverse(mvpMatrix);
 
     bgfx::setUniform(vdp1_modelViewProj, &mvpMatrix[0][0]);
-    bgfx::setUniform(vdp1_invModelViewProj, &invMvpMatrix[0][0]);
 
-    // Build per-frame texture with NDC corners + gouraud shading
-    // Layout: 8 texels per quad
-    //   texel 0-3: (ndcX, ndcY, u/w, v/w) per corner
-    //   texel 4:   (1/w0, 1/w1, 1/w2, 1/w3) - all zeros = near-clip sentinel
-    //   texel 5:   (gR0, gR1, gR2, gR3) - per-corner gouraud red [-0.5, 0.5]
-    //   texel 6:   (gG0, gG1, gG2, gG3) - per-corner gouraud green
-    //   texel 7:   (gB0, gB1, gB2, gB3) - per-corner gouraud blue
     size_t numQuads = model->mC_Quads.size();
-    uint16_t texWidth = (uint16_t)(numQuads * 8);
-
-    static std::vector<float> cornersData;
-    cornersData.resize(texWidth * 4);
-
-    const float nearClipThreshold = 0.01f;
+    if (numQuads == 0)
+        return;
 
     // Transform light vector into model space for gouraud computation
     // The model matrix transforms from model space to world space,
@@ -444,18 +436,171 @@ void drawObject(s_objectToRender* pObject, const glm::mat4& projectionMatrix)
         }
     }
 
+    // Fast 3D path (default ON on ARM64, override with PD_FAST_3D=0):
+    // streams per-vertex Gouraud in a_color0 and lets GLES hardware do
+    // perspective-correct UV & Gouraud interpolation, eliminating per-object
+    // RGBA32F texture create/upload/destroy, CPU vertex transforms, matrix
+    // inversion, and per-pixel inverseBilinear/raytracePath on Mali-G31.
+    static const bool fast3d = []() {
+        const char* e = getenv("PD_FAST_3D");
+        if (e && e[0]) return e[0] != '0';
+#if defined(__aarch64__)
+        return true;
+#else
+        return false;
+#endif
+    }();
+
+    if (fast3d)
+    {
+        struct sFast3dVertex
+        {
+            float position[3];
+            float texcoord0[2];
+            float color[3];
+        };
+        static bgfx::VertexLayout fastLayout;
+        static bool fastLayoutInit = false;
+        if (!fastLayoutInit)
+        {
+            fastLayout
+                .begin()
+                .add(bgfx::Attrib::Position, 3, bgfx::AttribType::Float)
+                .add(bgfx::Attrib::TexCoord0, 2, bgfx::AttribType::Float)
+                .add(bgfx::Attrib::Color0, 3, bgfx::AttribType::Float)
+                .end();
+            fastLayoutInit = true;
+        }
+
+        const uint32_t numVerts = (uint32_t)(numQuads * 4);
+        bgfx::TransientVertexBuffer tvb;
+        bgfx::allocTransientVertexBuffer(&tvb, numVerts, fastLayout);
+        sFast3dVertex* dst = (sFast3dVertex*)tvb.data;
+        const sMatrix4x3& modelMat = pObject->m_modelMatrix;
+
+        for (size_t i = 0; i < numQuads; i++)
+        {
+            const auto& quad = model->mC_Quads[i];
+            const u8 lightingMode = (quad.m8_lightingControl >> 8) & 3;
+            float gouraud[4][3] = {};
+
+            if (lightingMode > 0 && !quad.m14_extraData.empty())
+            {
+                const bool withColor = (lightingMode == 2);
+                auto computeViewDepth = [&](int vertexIndex) -> s32 {
+                    const auto& vtx = model->m_vertexBuffer[i * 4 + vertexIndex];
+                    s32 viewZ = (s32)(
+                        ((s64)modelMat.m[2][0] * (s32)(vtx.position[0] * 65536.0f) +
+                         (s64)modelMat.m[2][1] * (s32)(vtx.position[1] * 65536.0f) +
+                         (s64)modelMat.m[2][2] * (s32)(vtx.position[2] * 65536.0f)) >> 16)
+                        + (s32)modelMat.m[2][3];
+                    s32 absDepth = viewZ < 0 ? -viewZ : viewZ;
+                    return absDepth << 8;
+                };
+
+                if (gSmoothGouraud)
+                {
+                    for (int j = 0; j < 4; j++)
+                    {
+                        int normalIdx = (lightingMode == 1) ? 0 : j;
+                        if (normalIdx >= (int)quad.m14_extraData.size()) continue;
+                        float falloutSmooth[3];
+                        GetDistanceFalloffSmooth(falloutSmooth, computeViewDepth(j));
+                        ComputeColorFromNormalSmooth(quad.m14_extraData[normalIdx], withColor,
+                            lightVectorModelSpace, pObject->m_lightColor,
+                            falloutSmooth, gouraud[j]);
+                    }
+                }
+                else
+                {
+                    s32 falloutColor[3];
+                    GetDistanceFalloff(falloutColor, computeViewDepth(0));
+                    if (lightingMode == 1)
+                    {
+                        float perVertexColor[3];
+                        ComputeColorFromNormal(quad.m14_extraData[0], false,
+                            lightVectorModelSpace, pObject->m_lightColor,
+                            falloutColor, perVertexColor);
+                        for (int j = 0; j < 4; j++)
+                            for (int c = 0; c < 3; c++)
+                                gouraud[j][c] = perVertexColor[c];
+                    }
+                    else
+                    {
+                        for (int j = 0; j < 4; j++)
+                        {
+                            if (j < (int)quad.m14_extraData.size())
+                            {
+                                ComputeColorFromNormal(quad.m14_extraData[j], withColor,
+                                    lightVectorModelSpace, pObject->m_lightColor,
+                                    falloutColor, gouraud[j]);
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (int j = 0; j < 4; j++)
+            {
+                const auto& srcV = model->m_vertexBuffer[i * 4 + j];
+                sFast3dVertex& d = dst[i * 4 + j];
+                d.position[0] = srcV.position[0];
+                d.position[1] = srcV.position[1];
+                d.position[2] = srcV.position[2];
+                d.texcoord0[0] = srcV.texcoord0[0];
+                d.texcoord0[1] = srcV.texcoord0[1];
+                d.color[0] = gouraud[j][0];
+                d.color[1] = gouraud[j][1];
+                d.color[2] = gouraud[j][2];
+            }
+        }
+
+        const uint64_t state = 0
+            | BGFX_STATE_DEPTH_TEST_LEQUAL
+            | BGFX_STATE_WRITE_RGB
+            | BGFX_STATE_WRITE_A
+            | BGFX_STATE_WRITE_Z
+            | BGFX_STATE_CULL_CCW
+            | BGFX_STATE_MSAA
+            | BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_ZERO)
+            ;
+        bgfx::setState(state);
+        bgfx::setTexture(0, vdp1_textureSampler, model->m_textureAtlas);
+        bgfx::setVertexBuffer(0, &tvb);
+        bgfx::setIndexBuffer(model->m_indexBufferHandle);
+        setSpritePriorityDefault();
+        bgfx::submit(vdp1_gpuView, vdp1_program);
+        return;
+    }
+
+    glm::mat4 invMvpMatrix = glm::inverse(mvpMatrix);
+    bgfx::setUniform(vdp1_invModelViewProj, &invMvpMatrix[0][0]);
+
+    // Build per-frame texture with NDC corners + gouraud shading
+    // Layout: 8 texels per quad
+    //   texel 0-3: (ndcX, ndcY, u/w, v/w) per corner
+    //   texel 4:   (1/w0, 1/w1, 1/w2, 1/w3) - all zeros = near-clip sentinel
+    //   texel 5:   (gR0, gR1, gR2, gR3) - per-corner gouraud red [-0.5, 0.5]
+    //   texel 6:   (gG0, gG1, gG2, gG3) - per-corner gouraud green
+    //   texel 7:   (gB0, gB1, gB2, gB3) - per-corner gouraud blue
+    uint16_t texWidth = (uint16_t)(numQuads * 8);
+
+    static std::vector<float> cornersData;
+    cornersData.resize(texWidth * 4);
+
+    const float nearClipThreshold = 0.01f;
+
     for (size_t i = 0; i < numQuads; i++)
     {
-        float clipW[4];
+        glm::vec4 clipPos[4];
         bool nearClip = false;
 
         for (int j = 0; j < 4; j++)
         {
             const auto& vtx = model->m_vertexBuffer[i * 4 + j];
             glm::vec4 objPos(vtx.position[0], vtx.position[1], vtx.position[2], 1.0f);
-            glm::vec4 clipPos = mvpMatrix * objPos;
-            clipW[j] = clipPos.w;
-            if (clipPos.w < nearClipThreshold)
+            clipPos[j] = mvpMatrix * objPos;
+            if (clipPos[j].w < nearClipThreshold)
                 nearClip = true;
         }
 
@@ -464,21 +609,19 @@ void drawObject(s_objectToRender* pObject, const glm::mat4& projectionMatrix)
             for (int j = 0; j < 4; j++)
             {
                 const auto& vtx = model->m_vertexBuffer[i * 4 + j];
-                float invW = 1.0f / clipW[j];
-                glm::vec4 objPos(vtx.position[0], vtx.position[1], vtx.position[2], 1.0f);
-                glm::vec4 clipPos = mvpMatrix * objPos;
+                float invW = 1.0f / clipPos[j].w;
 
                 size_t idx = (i * 8 + j) * 4;
-                cornersData[idx + 0] = clipPos.x * invW;
-                cornersData[idx + 1] = clipPos.y * invW;
+                cornersData[idx + 0] = clipPos[j].x * invW;
+                cornersData[idx + 1] = clipPos[j].y * invW;
                 cornersData[idx + 2] = vtx.texcoord0[0] * invW;
                 cornersData[idx + 3] = vtx.texcoord0[1] * invW;
             }
             size_t idx = (i * 8 + 4) * 4;
-            cornersData[idx + 0] = 1.0f / clipW[0];
-            cornersData[idx + 1] = 1.0f / clipW[1];
-            cornersData[idx + 2] = 1.0f / clipW[2];
-            cornersData[idx + 3] = 1.0f / clipW[3];
+            cornersData[idx + 0] = 1.0f / clipPos[0].w;
+            cornersData[idx + 1] = 1.0f / clipPos[1].w;
+            cornersData[idx + 2] = 1.0f / clipPos[2].w;
+            cornersData[idx + 3] = 1.0f / clipPos[3].w;
         }
         else
         {

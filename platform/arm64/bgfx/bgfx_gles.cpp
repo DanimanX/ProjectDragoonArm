@@ -148,6 +148,8 @@ enum : GLenum
 	GL_TEXTURE_BASE_LEVEL = 0x813C,
 	GL_TEXTURE_MAX_LEVEL = 0x813D,
 	GL_PIXEL_PACK_BUFFER = 0x88EB,
+	GL_MAP_WRITE_BIT = 0x0002,
+	GL_MAP_UNSYNCHRONIZED_BIT = 0x0020,
 };
 
 // function pointers
@@ -187,6 +189,8 @@ enum : GLenum
 	X(void, glBindBuffer, (GLenum, GLuint)) \
 	X(void, glBufferData, (GLenum, GLsizeiptr, const void*, GLenum)) \
 	X(void, glBufferSubData, (GLenum, GLintptr, GLsizeiptr, const void*)) \
+	X(void*, glMapBufferRange, (GLenum, GLintptr, GLsizeiptr, GLbitfield)) \
+	X(GLboolean, glUnmapBuffer, (GLenum)) \
 	X(GLuint, glCreateShader, (GLenum)) \
 	X(void, glDeleteShader, (GLuint)) \
 	X(void, glShaderSource, (GLuint, GLsizei, const GLchar* const*, const GLint*)) \
@@ -301,7 +305,9 @@ namespace
 		bool used = false;
 		GLuint id = 0;
 		std::unordered_map<std::string, GLint> uniforms;
+		GLint attribLoc[bgfx::Attrib::Count];
 		std::string vsName, psName;
+		Program() { for (int i = 0; i < bgfx::Attrib::Count; ++i) attribLoc[i] = -1; }
 	};
 
 	struct Uniform
@@ -881,7 +887,7 @@ namespace bgfx
 	{
 		if (!g_transientVbo)
 		{
-			g_transientVboCap = 1u << 20;
+			g_transientVboCap = 2u << 20;
 			g_transientVboMem = (uint8_t*)malloc(g_transientVboCap);
 			p_glGenBuffers(1, &g_transientVbo);
 			p_glBindBuffer(GL_ARRAY_BUFFER, g_transientVbo);
@@ -903,16 +909,19 @@ namespace bgfx
 		}
 	}
 
+	static inline size_t align64(size_t n) { return (n + 63u) & ~(size_t)63u; }
+
 	bool allocTransientBuffers(TransientVertexBuffer* _tvb, const VertexLayout& _layout,
 	                           uint32_t _numVertices, TransientIndexBuffer* _tib, uint32_t _numIndices)
 	{
 		ensureTransient();
 		const size_t vneed = (size_t)_numVertices * _layout.getStride();
 		const size_t ineed = (size_t)_numIndices * sizeof(uint16_t);
-		if (g_transientVboUsed + vneed > g_transientVboCap) return false;
-		if (g_transientIboUsed + ineed > g_transientIboCap) return false;
+		const size_t vstep = align64(vneed);
+		const size_t istep = align64(ineed);
+		if (g_transientVboUsed + vstep > g_transientVboCap) return false;
+		if (g_transientIboUsed + istep > g_transientIboCap) return false;
 
-		// wrap-around: start the frame's ring again rather than failing
 		_tvb->data = g_transientVboMem + g_transientVboUsed;
 		_tvb->size = (uint32_t)vneed;
 		_tvb->startVertex = 0;
@@ -926,8 +935,8 @@ namespace bgfx
 		_tib->isIndex16 = true;
 		_tib->handle = bgfx::kInvalidHandle;
 
-		g_transientVboUsed += vneed;
-		g_transientIboUsed += ineed;
+		g_transientVboUsed += vstep;
+		g_transientIboUsed += istep;
 		return true;
 	}
 
@@ -935,13 +944,23 @@ namespace bgfx
 	{
 		ensureTransient();
 		const size_t need = (size_t)_num * _layout.getStride();
+		const size_t step = align64(need);
+		if (g_transientVboUsed + step > g_transientVboCap)
+		{
+			// Orphan & restart ring if a busy frame ever exceeds 2 MB.
+			p_glBindVertexArray(0);
+			p_glBindBuffer(GL_ARRAY_BUFFER, g_transientVbo);
+			p_glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)g_transientVboCap, NULL, GL_STREAM_DRAW);
+			p_glBindBuffer(GL_ARRAY_BUFFER, 0);
+			g_transientVboUsed = 0;
+		}
 		_tvb->data = g_transientVboMem + g_transientVboUsed;
 		_tvb->size = (uint32_t)need;
 		_tvb->startVertex = 0;
 		_tvb->stride = _layout.getStride();
 		_tvb->layout = _layout;
 		_tvb->handle = kInvalidHandle;
-		g_transientVboUsed += need;
+		g_transientVboUsed += step;
 	}
 
 	void allocTransientIndexBuffer(TransientIndexBuffer* _tib, uint32_t _num, bool _index32)
@@ -949,12 +968,21 @@ namespace bgfx
 		ensureTransient();
 		(void)_index32;
 		const size_t need = (size_t)_num * sizeof(uint16_t);
+		const size_t step = align64(need);
+		if (g_transientIboUsed + step > g_transientIboCap)
+		{
+			p_glBindVertexArray(0);
+			p_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_transientIbo);
+			p_glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)g_transientIboCap, NULL, GL_STREAM_DRAW);
+			p_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+			g_transientIboUsed = 0;
+		}
 		_tib->data = g_transientIboMem + g_transientIboUsed;
 		_tib->size = (uint32_t)need;
 		_tib->startIndex = 0;
 		_tib->isIndex16 = true;
 		_tib->handle = kInvalidHandle;
-		g_transientIboUsed += need;
+		g_transientIboUsed += step;
 	}
 
 	// --- shaders ---------------------------------------------------------
@@ -1057,15 +1085,49 @@ namespace bgfx
 		};
 		if (strstr(label, "VDP1_ps") != nullptr)
 		{
-			// VDP1_ps samples RGBA32F corner textures (s_ndcCorners, s_objCorners)
-			// and runs an inverse-bilinear quadratic solver per fragment. The
-			// transpiled ESSL declares those reads and intermediates `lowp`, which
-			// Mali-G31 executes as FP16 (10-bit mantissa -> broken UVs/NaN).
-			for (size_t at = body.find("lowp ");
-			     at != std::string::npos;
-			     at = body.find("lowp ", at + 1))
+			// Fast 3D path (default ON on ARM64, override with PD_FAST_3D=0):
+			// uses hardware perspective-correct v_texcoord0 + per-vertex Gouraud
+			// in v_color0 (supplied by drawObject()), avoiding 8-13 RGBA32F
+			// fetches + inverseBilinear() + raytracePath() per fragment on Mali-G31.
+			static const bool fast3d = []() {
+				const char* e = getenv("PD_FAST_3D");
+				if (e && e[0]) return e[0] != '0';
+#if defined(__aarch64__)
+				return true;
+#else
+				return false;
+#endif
+			}();
+			if (fast3d)
 			{
-				body.replace(at, 5, "highp ");
+				body =
+				    "out mediump vec4 bgfx_FragColor;\n"
+				    "in highp vec2 v_texcoord0;\n"
+				    "in highp vec4 v_color0;\n"
+				    "uniform sampler2D s_texture;\n"
+				    "uniform vec4 u_spritePriority;\n"
+				    "void main ()\n"
+				    "{\n"
+				    "  highp vec2 uv = v_texcoord0 / vec2(textureSize(s_texture, 0));\n"
+				    "  mediump vec4 txcol = texture(s_texture, uv);\n"
+				    "  if (txcol.a <= 0.0) discard;\n"
+				    "  mediump vec3 c = clamp(txcol.rgb + v_color0.rgb, 0.0, 1.0);\n"
+				    "  bgfx_FragColor = vec4(c, (u_spritePriority.x + 1.0) / 8.0);\n"
+				    "}\n";
+				fprintf(stderr, "[gles] shader patch applied: VDP1_ps fast 3D path\n");
+			}
+			else
+			{
+				// VDP1_ps samples RGBA32F corner textures (s_ndcCorners, s_objCorners)
+				// and runs an inverse-bilinear quadratic solver per fragment. The
+				// transpiled ESSL declares those reads and intermediates `lowp`, which
+				// Mali-G31 executes as FP16 (10-bit mantissa -> broken UVs/NaN).
+				for (size_t at = body.find("lowp ");
+				     at != std::string::npos;
+				     at = body.find("lowp ", at + 1))
+				{
+					body.replace(at, 5, "highp ");
+				}
 			}
 		}
 		if (strstr(label, "VDP2") != nullptr)
@@ -1427,6 +1489,10 @@ namespace bgfx
 			if (name.size() > 3 && name.compare(name.size() - 3, 3, "[0]") == 0)
 				name = name.substr(0, name.size() - 3);
 			p->uniforms[name] = p_glGetUniformLocation(prog, name.c_str());
+		}
+		for (int a = 0; a < Attrib::Count; ++a)
+		{
+			p->attribLoc[a] = p_glGetAttribLocation(prog, s_attribNames[a]);
 		}
 		fprintf(stderr, "[gles] program %s/%s -> handle %u, %d active uniforms\n",
 		        p->vsName.c_str(), p->psName.c_str(), handle, active);
@@ -2079,13 +2145,34 @@ namespace bgfx
 		}
 		if (g_tvb && g_tvb->data)
 		{
-			// bind vertex layout for the transient chunk
+			// bind vertex layout for the transient chunk. Use MAP_UNSYNCHRONIZED
+			// into our once-per-frame orphaned ring so Mali never ghosts or stalls
+			// on a 2 MB copy when issuing dozens of small 2D/3D transient draws.
 			const uintptr_t vboBase = (uintptr_t)(g_tvb->data - g_transientVboMem);
 			const uintptr_t vboOff = vboBase + (uintptr_t)g_tvbStart * g_tvb->layout.getStride();
 			p_glBindVertexArray(g_transientVao);
 			p_glBindBuffer(GL_ARRAY_BUFFER, g_transientVbo);
-			p_glBufferSubData(GL_ARRAY_BUFFER, (GLintptr)vboBase,
-			                  (GLsizeiptr)g_tvb->size, g_tvb->data);
+			if (p_glMapBufferRange && p_glUnmapBuffer && g_tvb->size > 0)
+			{
+				void* dst = p_glMapBufferRange(GL_ARRAY_BUFFER, (GLintptr)vboBase,
+				                               (GLsizeiptr)g_tvb->size,
+				                               GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+				if (dst)
+				{
+					memcpy(dst, g_tvb->data, g_tvb->size);
+					p_glUnmapBuffer(GL_ARRAY_BUFFER);
+				}
+				else
+				{
+					p_glBufferSubData(GL_ARRAY_BUFFER, (GLintptr)vboBase,
+					                  (GLsizeiptr)g_tvb->size, g_tvb->data);
+				}
+			}
+			else
+			{
+				p_glBufferSubData(GL_ARRAY_BUFFER, (GLintptr)vboBase,
+				                  (GLsizeiptr)g_tvb->size, g_tvb->data);
+			}
 
 			GLuint enabledLocs[Attrib::Count];
 			int numEnabled = 0;
@@ -2093,7 +2180,7 @@ namespace bgfx
 			for (int a = 0; a < Attrib::Count; ++a)
 			{
 				if (!lay.has((Attrib::Enum)a)) continue;
-				GLint loc = p_glGetAttribLocation(solid ? solid : prog.id, s_attribNames[a]);
+				GLint loc = solid ? p_glGetAttribLocation(solid, s_attribNames[a]) : prog.attribLoc[a];
 				if (loc < 0) continue;
 				const VertexLayout::Attr& at = lay.m_attr[a];
 				GLenum ty = GL_FLOAT;
@@ -2115,13 +2202,41 @@ namespace bgfx
 				const uintptr_t iboBase = (uintptr_t)(g_tib->data - g_transientIboMem);
 				const uintptr_t iboOff = iboBase + (uintptr_t)g_ibFirst * sizeof(uint16_t);
 				p_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_transientIbo);
-				p_glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, (GLintptr)iboBase,
-				                  (GLsizeiptr)g_tib->size, g_tib->data);
+				if (p_glMapBufferRange && p_glUnmapBuffer && g_tib->size > 0)
+				{
+					void* dst = p_glMapBufferRange(GL_ELEMENT_ARRAY_BUFFER, (GLintptr)iboBase,
+					                               (GLsizeiptr)g_tib->size,
+					                               GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+					if (dst)
+					{
+						memcpy(dst, g_tib->data, g_tib->size);
+						p_glUnmapBuffer(GL_ELEMENT_ARRAY_BUFFER);
+					}
+					else
+					{
+						p_glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, (GLintptr)iboBase,
+						                  (GLsizeiptr)g_tib->size, g_tib->data);
+					}
+				}
+				else
+				{
+					p_glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, (GLintptr)iboBase,
+					                  (GLsizeiptr)g_tib->size, g_tib->data);
+				}
 				const GLsizei totalIdx = (GLsizei)(g_tib->size / sizeof(uint16_t));
 				const GLsizei availIdx = (g_ibFirst < (uint32_t)totalIdx) ? (totalIdx - (GLsizei)g_ibFirst) : 0;
 				const GLsizei count = (g_ibCount == UINT32_MAX || (GLsizei)g_ibCount > availIdx) ? availIdx : (GLsizei)g_ibCount;
 				if (count > 0)
 					p_glDrawElements(mode, count, GL_UNSIGNED_SHORT, (const void*)iboOff);
+			}
+			else if (isBufHandle(g_ib) && (*bufSlot(g_ib)).used)
+			{
+				Buffer& ib = (*bufSlot(g_ib));
+				p_glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ib.id);
+				const GLsizei count = (GLsizei)(g_ibCount == UINT32_MAX ? ib.count - g_ibFirst : g_ibCount);
+				if (count > 0)
+					p_glDrawElements(mode, count, GL_UNSIGNED_SHORT,
+					                 (const void*)(uintptr_t)(g_ibFirst * sizeof(uint16_t)));
 			}
 			else if (lay.getStride() > 0)
 			{
@@ -2150,7 +2265,7 @@ namespace bgfx
 			for (int a = 0; a < Attrib::Count; ++a)
 			{
 				if (!vb.layout.has((Attrib::Enum)a)) continue;
-				GLint loc = p_glGetAttribLocation(solid ? solid : prog.id, s_attribNames[a]);
+				GLint loc = solid ? p_glGetAttribLocation(solid, s_attribNames[a]) : prog.attribLoc[a];
 				{
 					static const char* t3 = getenv("PDS_TRACE_GL");
 					static unsigned q = 0;

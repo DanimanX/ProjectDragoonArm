@@ -117,8 +117,10 @@ pd_audio_restore() {
 }
 
 # --- performance -----------------------------------------------------------
-# The H700 defaults to schedutil and the Mali devfreq to a low clock; the first
-# seconds then look like a rendering bug instead of a clock ramp.
+# The H700 defaults to schedutil and the Mali devfreq only exposes
+# simple_ondemand (so writing "performance" to governor silently fails and the
+# GPU idles at 240 MHz instead of 696 MHz). Raise min_freq to the highest
+# available frequency for the session and restore it on exit.
 ORIG_GOV=""
 if [ -w /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]; then
     ORIG_GOV=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true)
@@ -126,9 +128,20 @@ if [ -w /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]; then
         echo performance > "$g" 2>/dev/null || true
     done
 fi
-for dev in /sys/class/devfreq/*/governor; do
-    [ -w "$dev" ] && echo performance > "$dev" 2>/dev/null
-done
+ORIG_GPU_MIN=""
+GPU_DEVFREQ="/sys/class/devfreq/gpu"
+if [ -w "$GPU_DEVFREQ/min_freq" ] && [ -r "$GPU_DEVFREQ/available_frequencies" ]; then
+    ORIG_GPU_MIN=$(cat "$GPU_DEVFREQ/min_freq" 2>/dev/null || true)
+    GPU_MAX=$(tr ' ' '\n' < "$GPU_DEVFREQ/available_frequencies" | awk 'NF && $1+0 > m { m = $1+0 } END { print m }')
+    if [ -n "$GPU_MAX" ] && [ "$GPU_MAX" -gt 0 ] 2>/dev/null; then
+        echo "$GPU_MAX" > "$GPU_DEVFREQ/min_freq" 2>/dev/null || true
+        echo "gpu: min_freq -> $(cat "$GPU_DEVFREQ/cur_freq" 2>/dev/null || echo "$GPU_MAX") Hz"
+    fi
+else
+    for dev in /sys/class/devfreq/*/governor; do
+        [ -w "$dev" ] && echo performance > "$dev" 2>/dev/null || true
+    done
+fi
 
 # FAT/exFAT copies lose the executable bit.
 chmod +x "$GAMEDIR/panzerdragoon.aarch64" 2>/dev/null
@@ -174,7 +187,21 @@ fi
 if [ -n "$ES_PID" ]; then
     kill -STOP "$ES_PID" 2>/dev/null && echo "ES ($ES_PID) suspended for the session"
 fi
-trap pd_es_resume EXIT INT TERM HUP
+pd_perf_restore() {
+    if [ -n "${ORIG_GPU_MIN:-}" ] && [ -w "$GPU_DEVFREQ/min_freq" ]; then
+        echo "$ORIG_GPU_MIN" > "$GPU_DEVFREQ/min_freq" 2>/dev/null || true
+    fi
+    if [ -n "${ORIG_GOV:-}" ]; then
+        for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+            echo "$ORIG_GOV" > "$g" 2>/dev/null || true
+        done
+    fi
+}
+pd_cleanup() {
+    pd_es_resume
+    pd_perf_restore
+}
+trap pd_cleanup EXIT INT TERM HUP
 
 # --- run -------------------------------------------------------------------
 cd "$DATA" || exit 1
@@ -188,10 +215,6 @@ if [ -s "$PD_ES_FRAME" ] && [ -w /dev/fb0 ]; then
 fi
 pd_es_resume
 pd_audio_restore
-if [ -n "$ORIG_GOV" ]; then
-    for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-        echo "$ORIG_GOV" > "$g" 2>/dev/null || true
-    done
-fi
+pd_perf_restore
 if command -v pm_finish >/dev/null 2>&1; then pm_finish >/dev/null 2>&1 || true; fi
 exit $RC

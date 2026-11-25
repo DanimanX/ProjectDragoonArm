@@ -59,18 +59,22 @@ but not proven. Last updated: 2026-11-24.
 | 12 | `bgfx::copy()` / `makeRef()` never freed their allocations; `VDP1_ps` transpiled `RGBA32F` corner fetches and inverse-bilinear solver as `lowp` | Leaked ~10+ MB/sec in 3D gameplay from per-object `ndcCornersTex`; `lowp` FP16 math in `VDP1_ps` breaks UVs on Mali-G31. Freed `bgfx::Memory` on consumption, forced `highp` in `VDP1_ps`, and forced `GL_NEAREST` on `GL_FLOAT` textures |
 | 13 | Unnecessary per-frame GPU/CPU bandwidth in the VDP1/VDP2 path | Dropped dead 512 KB/frame `bgfx_vdp1_ram_texture` upload (never sampled), dirty-checked + partial-row uploaded VDP2 VRAM/CRAM, cached static VDP2 layers (`renderLayerGPU` skips redraw when VRAM/CRAM/config unchanged), removed unused `vdp1PriorityTexture` MRT attachment, scaled VDP1 FBO to 0.5x (`360x270`, configurable via `PD_VDP1_SCALE`) on ARM64, skipped disabled VDP2 layer texture fetches in `VDP2_composite_ps`, skipped unused 315 KB `vdp1TextureOutput` memset, and shrunk transient buffers from 10 MB to 1.25 MB |
 | 14 | CPK movie bottom artifact strip, shifted name-entry cursor, D-pad ignored in 3D field, and frame pacing | Removed obsolete `0x14040` bitmap base override (with `highp int` fixed, `MPOFN=0` + `SCYN0=16` + Window 0 `24..199` centers the 320x176 movie with clean black bars); gated `picture fit` viewport transform on `target == g_defaultFbo` so VDP1 is no longer double-shifted/scaled; reported Saturn digital controller (`m0_inputType=1`) for evdev D-pad input so Edge moves with the D-pad in 3D towns/fields; fixed `WaitNextFrame` drift/micro-sleeps (`<4 ms`) that pushed frames past the 33.3 ms vblank deadline |
+| 15 | Mali-G31 stuck at 240–420 MHz, `glBufferSubData` transient buffer ghosting, heavy `VDP1_ps` + per-object `RGBA32F` texture thrash, and wide VRAM dirty uploads | Mali devfreq only exposes `simple_ondemand` (so `echo performance > governor` silently failed); launcher now raises `/sys/class/devfreq/gpu/min_freq` to the highest available clock (`696 MHz`) and restores it on exit/signal. Replaced per-draw `glBufferSubData` on the shared transient VBO/IBO with 64-byte-aligned `glMapBufferRange(GL_MAP_WRITE_BIT \| GL_MAP_UNSYNCHRONIZED_BIT)` + cached per-program `attribLoc`, dropping name-entry/UI `v1_2d` from `16–19 ms` to `0.1 ms`. Added `PD_FAST_3D` (default ON on ARM64, `PD_FAST_3D=0` for Saturn-exact inverse-bilinear) that streams per-vertex Gouraud in `a_color0` with static index buffers and a 1-fetch perspective-correct `VDP1_ps` (eliminating per-object `RGBA32F` texture create/upload/destroy, `glm::inverse`, CPU vertex transforms, and 8–13 `RGBA32F` fetches + `inverseBilinear`/`raytracePath` per fragment). Switched VDP2 VRAM upload to dirty 4 KB (16-row) contiguous runs and fixed `decodeVdp1Quad` buffer leak |
 
 ## Verified on RG34XX (2026-11-24)
 
-- **Name-entry screen & 3D field verified on Mali-G31** via direct panel captures
-  over SSH: aligned green cursor on name entry (`nonBlack 22.6%`), clean 3D
-  Excavation Site #4 corridor (`nonBlack 66.4%`), clean shutdown (`rc=0`).
-- **30.0 FPS locked across all stages on the RG34XX** (`PD_TRACE_FPS=1`,
-  un-synced):
-  - Intro / title / CPK cinematics: **29.8 – 30.5 fps** (`32.8 – 33.6 ms/frame`)
-  - Name-entry screen: **29.4 – 30.8 fps** (`32.5 – 34.0 ms/frame`)
-  - 3D field (Excavation Site #4): **29.8 – 30.3 fps** (`33.0 – 33.6 ms/frame`
-    after first-frame shader compile at `24.0 fps`), up from `9.9 fps` (`47–73 ms` GPU).
+- **Name-entry screen, D-pad movement, and 3D field verified on Mali-G31** via
+  direct panel captures over SSH: aligned green cursor on name entry
+  (`nonBlack 22.8%`), Edge walking forward with the D-pad through Excavation
+  Site #4 corridor up to the interactive door switch, clean shutdown (`rc=0`).
+- **30.0 FPS locked with ~80% frame headroom on the RG34XX** (`PD_TRACE_PERF=1`,
+  un-synced, GPU at `696 MHz`):
+  - Intro / title / CPK cinematics: **30.0 fps** (`tasks=0.1–0.6 ms`, `vram=1.9–2.1 ms`, `swap=0.4–1.8 ms`)
+  - Name-entry screen: **30.0 fps**, `v1_2d` reduced from **16.3–19.1 ms → 0.1 ms** (~180× faster)
+  - 3D field (Excavation Site #4, 36 objects / 1080 quads, walking): **30.0 fps**,
+    total active work **~6.4 ms/frame** (`tasks=0.3 ms`, `vram=2.6 ms`, `bg=0.6 ms`,
+    `obj3d=2.1 ms`, `v1_2d=0.1 ms`, `comp=0.3 ms`, `swap=0.4 ms` steady-state),
+    down from `~22 ms/frame` (`vram=4.1 ms`, `obj3d=4.8 ms`, `swap=5–12.4 ms` at `420 MHz`).
 
 ## Pending
 
